@@ -354,6 +354,9 @@ async function configureInteractive() {
 			name: 'useRegions',
 			message: 'Which regions would you like to use?',
 			choices: Object.keys(computedQuotas.regions),
+			validate: (input) => {
+				return (input.length > 5 && !process.env?.ALLOW_UNLIMITED_REGIONS) ? "Select 5 or fewer." : true;
+			},
 			default: settings.useRegions ?? Object.keys(computedQuotas.regions)
 		}, {
 			type: 'input',
@@ -392,6 +395,8 @@ async function configureInteractive() {
 	}
 
 	fs.writeFileSync('npk-settings.json', JSON.stringify(Object.assign(settings, answers), null, '\t'));
+
+	await persistSettings(settings);
 
 	if (!deployNow) {
 		console.log("[-] Exiting on user command. Use 'npm run deploy' to deploy");

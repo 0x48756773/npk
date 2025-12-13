@@ -2,9 +2,11 @@
 
 # curl https://npkproject.io/cloudshell_install_dev.sh | bash
 
-TF_CLI_ARGS_apply="-parallelism=1"
-NODE_OPTIONS="--max-old-space-size=1536"
-NODE_VERSION=20.19.2
+export TF_LOG=TRACE
+export TF_LOG_PATH=/tmp/terraform_debug.log
+# export TF_CLI_ARGS_apply="-parallelism=1"
+# export NODE_OPTIONS="--max-old-space-size=1536"
+export NODE_VERSION=20.19.2
 
 if [[ $UID -eq 0 ]]; then
 	echo "[!] Don't run this as root."
@@ -45,6 +47,9 @@ if [[ ! -d /aws/mde/npk ]]; then
 	sudo mkdir /aws/mde/npk
 	sudo chown cloudshell-user:cloudshell-user /aws/mde/npk
 fi
+
+export GOGC=10
+export GOMEMLIMIT=700MiB
 
 # Pull the repo:
 if [[ ! -f /aws/mde/npk/README.md ]]; then
