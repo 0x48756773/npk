@@ -333,7 +333,9 @@ local regionKeys = std.objectFields(settings.regions);
 		resource: iam.iam_role(
 			"npk_ec2_compress",
 			"NPK Compression Nodes",
-			{},
+			{
+				"AmazonSSMManagedInstanceCore": "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+			},
 	        {
 	        	EC2Compression: [{
 					Sid: "s3ToProcess",
@@ -721,10 +723,12 @@ local regionKeys = std.objectFields(settings.regions);
 		},{
 			sid: "ddb",
 			actions: [
-				"dynamodb:UpdateItem"
+				"dynamodb:UpdateItem",
+				"dynamodb:Query"
 			],
 			resources: [
-				"${aws_dynamodb_table.campaigns.arn}"
+				"${aws_dynamodb_table.campaigns.arn}",
+				"${aws_dynamodb_table.campaigns.arn}/index/SpotFleetRequests"
 			]
 		}]
 	}),
@@ -843,6 +847,16 @@ local regionKeys = std.objectFields(settings.regions);
 				"${aws_sqs_queue.status_reporter_dlq.arn}"
 			]
 		}]
+	}),
+	'lambda-compute_node.tf.json': lambda.lambda_function("compute_node", {
+		handler: "main.main",
+		timeout: 10,
+		memory_size: 128,
+		environment: {
+			variables: {}
+		}
+	}, {
+		statement: []
 	}),
 	'null_resources.tf.json': null_resources.resource(settings),
 	'provider.tf.json': {

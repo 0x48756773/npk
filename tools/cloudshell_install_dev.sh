@@ -2,7 +2,11 @@
 
 # curl https://npkproject.io/cloudshell_install_dev.sh | bash
 
-NODE_VERSION=20.19.2
+export TF_LOG=TRACE
+export TF_LOG_PATH=/tmp/terraform_debug.log
+# export TF_CLI_ARGS_apply="-parallelism=1"
+# export NODE_OPTIONS="--max-old-space-size=1536"
+export NODE_VERSION=20.19.2
 
 if [[ $UID -eq 0 ]]; then
 	echo "[!] Don't run this as root."
@@ -12,8 +16,11 @@ fi
 # install compiler and cmake3, aliased to cmake
 if [[ ! -f /usr/bin/cmake ]]; then
 	echo "[*] Installing CMake3, C++"
-	sudo yum install -y cmake3 gcc-c++ > /dev/null
-	sudo ln -s /usr/bin/cmake3 /usr/bin/cmake
+	sudo yum install -y cmake3 gcc-c++
+
+	if [[ ! -f /usr/bin/cmake ]]; then
+		sudo ln -s /usr/bin/cmake3 /usr/bin/cmake
+	fi
 fi
 
 # install nvm and node
@@ -23,7 +30,7 @@ if [[ ! -d /aws/mde/nvm ]]; then
 	sudo chown cloudshell-user:cloudshell-user /aws/mde/nvm
 
 	sudo ln -s /aws/mde/nvm ~/.nvm
-	curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.1/install.sh | bash > /dev/null
+	curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.1/install.sh | bash
 fi
 
 export NVM_DIR="/aws/mde/nvm"
@@ -41,10 +48,13 @@ if [[ ! -d /aws/mde/npk ]]; then
 	sudo chown cloudshell-user:cloudshell-user /aws/mde/npk
 fi
 
+export GOGC=10
+export GOMEMLIMIT=700MiB
+
 # Pull the repo:
 if [[ ! -f /aws/mde/npk/README.md ]]; then
 	echo "[*] Cloning the NPK repo"
-	git clone https://github.com/c6fc/npk.git /aws/mde/npk > /dev/null
+	git clone https://github.com/c6fc/npk.git /aws/mde/npk
 fi
 
 # Run the deploy:

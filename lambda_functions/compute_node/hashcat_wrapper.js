@@ -25,9 +25,9 @@ var apiClient = null;
 var credentialsReady = 0;
 var credFailureCount = 0;
 
-var getCredentials = function() {
+var getCredentials = function () {
 	return new Promise((success, failure) => {
-		aws.config.getCredentials(function(err) {
+		aws.config.getCredentials(function (err) {
 			if (err) {
 				credFailureCount++;
 				console.log("Error retrieving credentials:" + err);
@@ -61,9 +61,6 @@ function getHashcatParams(manifest) {
 
 	var params = [
 		"--quiet",
-		"-O",
-		"-o",
-		"/potfiles/cracked_hashes-" + instance_id + ".txt",
 		"--outfile-check-dir",
 		"/potfiles/",
 		"--outfile-check-timer",
@@ -73,11 +70,7 @@ function getHashcatParams(manifest) {
 		"-m",
 		manifest.hashType,
 		"-a",
-		manifest.attackType,
-		"--status",
-		"--status-json",
-		"--status-timer",
-		"30"
+		manifest.attackType
 	];
 
 	if (manifest.manualArguments) {
@@ -85,8 +78,17 @@ function getHashcatParams(manifest) {
 		params = params.concat(manifest.manualArguments.split(" "));
 	}
 
+	params = params.concat([
+		"-o",
+		"/potfiles/cracked_hashes-" + instance_id + ".txt",
+		"--status",
+		"--status-json",
+		"--status-timer",
+		"30"
+	]);
+
 	if (manifest.attackType == 0) {
-		fs.readdirSync('/root/npk-rules/').forEach(function(e) {
+		fs.readdirSync('/root/npk-rules/').forEach(function (e) {
 			params.push("-r");
 			params.push("/root/npk-rules/" + e);
 		});
@@ -94,11 +96,11 @@ function getHashcatParams(manifest) {
 
 	params.push("/root/hashes.txt");
 
-	if ([0,6].indexOf(manifest.attackType) >= 0) {
+	if ([0, 6].indexOf(manifest.attackType) >= 0) {
 		params.push("/root/npk-wordlist/" + fs.readdirSync("/root/npk-wordlist/")[0]);
 	}
 
-	if ([3,6].indexOf(manifest.attackType) >= 0) {
+	if ([3, 6].indexOf(manifest.attackType) >= 0) {
 		if (manifest.manualMask) {
 			params.push(manifest.manualMask);
 		} else {
@@ -109,20 +111,20 @@ function getHashcatParams(manifest) {
 	return getKeyspace(params);
 }
 
-var readOutput = function(output) {
+var readOutput = function (output) {
 
 	try {
 		var status = JSON.parse(output);
 	} catch (e) {
 		return false;
 	}
-		
+
 	// console.log("Found status report in output");
 	// console.log(status);
 
 	var hashrate = 0;
 	var performance = {};
-	status.devices.forEach(function(device) {
+	status.devices.forEach(function (device) {
 		hashrate += device.speed;
 		performance[device.device_id] = device.speed;
 	});
@@ -159,16 +161,16 @@ function getKeyspace(params) {
 		});
 
 		var output = "";
-		hashcat.stdout.on('data', function(data) {
+		hashcat.stdout.on('data', function (data) {
 			console.log("1> " + data.toString().replace("\n", ""));
 			output += data;
 		});
 
-		hashcat.stderr.on('data', function(data) {
+		hashcat.stderr.on('data', function (data) {
 			console.log("2> " + data);
 		});
 
-		hashcat.on('exit', function(code, signal) {
+		hashcat.on('exit', function (code, signal) {
 
 			console.log(" ");
 			output = output.split("\n").splice(-2, 1);
@@ -178,7 +180,7 @@ function getKeyspace(params) {
 				var skip = limit * (instance_number - 1);
 
 				console.log("Got keyspace [ " + output.toString().replace(/(\d)(?=(\d{3})+(?!\d))/g, '$1,') + " ].");
-				console.log("As node [ " + instance_number + " ] of [ " + instance_count + " ] I'll skip [ " + skip.toString().replace(/(\d)(?=(\d{3})+(?!\d))/g, '$1,') + " ]." );
+				console.log("As node [ " + instance_number + " ] of [ " + instance_count + " ] I'll skip [ " + skip.toString().replace(/(\d)(?=(\d{3})+(?!\d))/g, '$1,') + " ].");
 
 				//Put the hashfile back.
 				params.splice(keyspaceIndex, 1, "/root/hashes.txt");
@@ -213,17 +215,17 @@ function runHashcat(params) {
 		});
 
 		var output = "";
-		hashcat.stdout.on('data', function(data) {
+		hashcat.stdout.on('data', function (data) {
 			readOutput(data);
 			output += data;
 			output = output.split("\n").pop();
 		});
 
-		hashcat.stderr.on('data', function(data) {
+		hashcat.stderr.on('data', function (data) {
 			console.log("Hashcat stderr: " + data);
 		});
 
-		hashcat.on('exit', function(code, signal) {
+		hashcat.on('exit', function (code, signal) {
 
 			/* 	Only treating negative numbers as actual errors, based on:
 				https://github.com/hashcat/hashcat/blob/master/docs/status_codes.txt	*/
@@ -240,7 +242,7 @@ function runHashcat(params) {
 			}
 
 			console.log("\n\n");
-			
+
 			return success(sendFinished(false));
 		});
 	});
@@ -261,10 +263,10 @@ var sendStatusUpdate = function (body) {
 			return failure(false);
 		}
 
-		apiClient.invokeApi(pathParams, pathTemplate, "POST", {}, body).then(function(result) {
+		apiClient.invokeApi(pathParams, pathTemplate, "POST", {}, body).then(function (result) {
 			console.log("Status update sent.");
 			success(true);
-		}).catch(function(err) {
+		}).catch(function (err) {
 			// console.error(err.response.statusCode);
 			console.log("Error sending status update to API Gateway");
 			console.error(err);
@@ -291,7 +293,7 @@ var sendFinished = function (completed) {
 		const recoveredHashes = [
 			...new Set(fs.readdirSync("/potfiles")
 				.filter(f => /^cracked_hashes-/.test(f))
-				.reduce((a, c) => 
+				.reduce((a, c) =>
 					a.concat(fs.readFileSync(`/potfiles/${c}`, "ascii").trim().split("\n")),
 					[]
 				)
@@ -302,10 +304,10 @@ var sendFinished = function (completed) {
 
 		fs.writeFileSync('/potfiles/all_cracked_hashes.txt', recoveredHashes.join("\n"));
 
-		apiClient.invokeApi(nodeParams, nodeTemplate, "POST", {}, { completed, recoveredHashes: recoveredHashes.length }).then(function(result) {
+		apiClient.invokeApi(nodeParams, nodeTemplate, "POST", {}, { completed, recoveredHashes: recoveredHashes.length }).then(function (result) {
 			console.log("Node marked as complete.");
 			success(true);
-		}).catch(function(err) {
+		}).catch(function (err) {
 			// console.error(err.response.statusCode);
 			console.error(err.response.data);
 			failure(false);
@@ -325,7 +327,7 @@ getCredentials().then((data) => {
 }, (e) => {
 	console.log("Fatal error determining keyspace.", e);
 	process.exit();
-}).then((data) => {	
+}).then((data) => {
 	console.log("Final update delivered.");
 	process.exit();
 }, (e) => {

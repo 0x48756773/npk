@@ -106,7 +106,6 @@
 					],
 					"resources": [
 						"${aws_s3_bucket.user_data.arn}",
-						"arn:aws:s3:::ec2-amd-linux-drivers"
 					],
 					"condition": {
 						"test": "StringLike",
@@ -122,6 +121,14 @@
 					],
 					"resources": [
 						"${aws_api_gateway_deployment.%s.execution_arn}*/statusreport/*" % apiName
+					]
+				}, {
+					"sid": "7",
+					"actions": [
+						"lambda:GetFunction"
+					],
+					"resources": [
+						"${aws_lambda_function.compute_node.arn}"
 					]
 				}]
 			}

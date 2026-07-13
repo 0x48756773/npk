@@ -11,11 +11,10 @@ export TOKEN=`curl -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec
 export INSTANCEID=`wget "--header=X-aws-ec2-metadata-token: $TOKEN" -qO- http://169.254.169.254/latest/meta-data/instance-id`
 export REGION=`wget "--header=X-aws-ec2-metadata-token: $TOKEN" -qO- http://169.254.169.254/latest/meta-data/placement/availability-zone | sed 's/.$//'`
 aws ec2 describe-tags --region $REGION --filter "Name=resource-id,Values=$INSTANCEID" --output=text | sed -r 's/TAGS\t(.*)\t.*\t.*\t(.*)/\1="\2"/' | sed -r 's/aws:ec2spot:fleet-request-id/SpotFleet/' > ec2-tags
-
 . ec2-tags
 
 # This is required for the wrapper to get anything done.
-export ManifestPath=$ManifestPath
+export ManifestPath="{{MANIFESTPATH}}"
 echo $ManifestPath > /root/manifestpath
 
 export BUCKET=${dictionaryBucket}
@@ -55,7 +54,8 @@ else
 	ln -s /nvme1n1/npk-wordlist /root/npk-wordlist
 fi;
 
-aws s3 cp s3://$BUCKET/components-v3/compute-node.7z .
+LAMBDA_URL=$(aws lambda get-function --function-name compute_node --region $USERDATAREGION --query 'Code.Location' --output text)
+wget -O compute-node.zip "$LAMBDA_URL"
 aws s3 cp s3://$USERDATA/$ManifestPath/manifest.json .
 
 # Install nvm
@@ -135,7 +135,8 @@ fi
 
 7z x hashcat*.7z && mv hashcat-*/ hashcat
 7z x maskprocessor*.7z && mv maskprocessor-*/ maskprocessor
-7z x compute-node.7z
+mkdir compute-node
+7z x compute-node.zip -o./compute-node/
 
 # Put the envvars in a useful place, in case debugging is needed.
 echo "export APIGATEWAY=$APIGATEWAY" >> envvars
