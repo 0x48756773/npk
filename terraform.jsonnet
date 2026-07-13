@@ -723,10 +723,12 @@ local regionKeys = std.objectFields(settings.regions);
 		},{
 			sid: "ddb",
 			actions: [
-				"dynamodb:UpdateItem"
+				"dynamodb:UpdateItem",
+				"dynamodb:Query"
 			],
 			resources: [
-				"${aws_dynamodb_table.campaigns.arn}"
+				"${aws_dynamodb_table.campaigns.arn}",
+				"${aws_dynamodb_table.campaigns.arn}/index/SpotFleetRequests"
 			]
 		}]
 	}),
