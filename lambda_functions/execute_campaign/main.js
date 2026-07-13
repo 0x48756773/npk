@@ -282,7 +282,8 @@ exports.main = async function(event, context, callback) {
 		// Build a launchSpecification for each AZ in the target region.
 
 		const instance_userdata = new Buffer.from(fs.readFileSync(__dirname + '/userdata.sh', 'utf-8')
-			.replace("{{APIGATEWAY}}", process.env.apigateway))
+			.replace("{{APIGATEWAY}}", process.env.apigateway)
+			.replace("{{MANIFESTPATH}}", `${entity}/campaigns/${campaignId}`))
 			.toString('base64');
 
 		const launchSpecificationTemplate = {
@@ -313,9 +314,6 @@ exports.main = async function(event, context, callback) {
 				Tags: [{
 					Key: "MaxCost",
 					Value: ((manifest.priceTarget < variables.campaign_max_price) ? manifest.priceTarget : variables.campaign_max_price).toString()
-				}, {
-					Key: "ManifestPath",
-					Value: `${entity}/campaigns/${campaignId}`
 				}]
 			}],
             UserData: instance_userdata

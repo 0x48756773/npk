@@ -846,6 +846,16 @@ local regionKeys = std.objectFields(settings.regions);
 			]
 		}]
 	}),
+	'lambda-compute_node.tf.json': lambda.lambda_function("compute_node", {
+		handler: "main.main",
+		timeout: 10,
+		memory_size: 128,
+		environment: {
+			variables: {}
+		}
+	}, {
+		statement: []
+	}),
 	'null_resources.tf.json': null_resources.resource(settings),
 	'provider.tf.json': {
 		terraform: {

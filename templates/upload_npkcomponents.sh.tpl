@@ -29,7 +29,6 @@ echo "- Downloading components"
 # 	wget -O ${basepath}/components/maskprocessor.7z https://github.com/hashcat/maskprocessor/releases/download/v0.73/maskprocessor-0.73.7z
 # fi
 
-7z a components/compute-node.7z compute-node/
 
 echo "- Uploading to S3"
 aws s3 sync ${basepath}/components/ s3://${dictionaryBucket}/components-v3/ $${@:1} --region ${dictionaryBucketRegion}

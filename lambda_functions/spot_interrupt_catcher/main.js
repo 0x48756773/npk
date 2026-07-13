@@ -48,21 +48,40 @@ exports.main = async function (event, context, callback) {
 	let user, campaignId;
 	
 	try {
-		// Pull the campaign from the ManifestPath tag
-		if (!instance.Tags?.ManifestPath || instance.Tags.ManifestPath.indexOf('/campaigns/') < 0) {
-			console.log(`[!] Instance tag 'ManifestPath' is invalid. Got tags: ${JSON.stringify(instance.Tags)}`);
-			return callback("Instance tag 'ManifestPath' is invalid");
+		const spotFleetRequestId = instance.Tags['aws:ec2spot:fleet-request-id'];
+		if (!spotFleetRequestId) {
+			console.log(`[!] Instance tag 'aws:ec2spot:fleet-request-id' is missing. Got tags: ${JSON.stringify(instance.Tags)}`);
+			return callback("aws:ec2spot:fleet-request-id tag is missing");
 		}
 
-		[user, campaignId] = instance.Tags.ManifestPath.split('/campaigns/');
+		console.log(`[+] Querying Campaigns GSI for spotFleetRequestId: ${spotFleetRequestId}`);
 
-		// Update that campaign details
 		const ddb = new aws.DynamoDB({ region: settings.region });
 
+		const campaignQuery = await ddb.query({
+			TableName: "Campaigns",
+			IndexName: "SpotFleetRequests",
+			KeyConditionExpression: "spotFleetRequestId = :sfr",
+			ExpressionAttributeValues: {
+				":sfr": { S: spotFleetRequestId }
+			}
+		}).promise();
+
+		if (!campaignQuery.Items || campaignQuery.Items.length === 0) {
+			console.log(`[!] No campaign found for SpotFleetRequestId: ${spotFleetRequestId}`);
+			return callback("No campaign found for SpotFleetRequestId");
+		}
+
+		const campaignItem = campaignQuery.Items[0];
+		user = campaignItem.userid.S;
+		const campaignKey = campaignItem.keyid.S;
+		campaignId = campaignKey.split(':')[1];
+
+		// Update that campaign details
 		await ddb.updateItem({
 			Key: {
 				userid: { S: user },
-				keyid: { S: `campaigns:${campaignId}` }
+				keyid: { S: campaignKey }
 			},
 			TableName: "Campaigns",
 			AttributeUpdates: {
