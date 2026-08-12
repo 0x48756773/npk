@@ -1,0 +1,5 @@
+# Anything that runs on Linux must stay LF regardless of the platform it was edited on.
+# A CRLF in a shell script fails in CloudShell and on the GPU nodes with a bare
+# "$'\r': command not found", which gives no useful hint about the real cause.
+*.sh text eol=lf
+*.tpl text eol=lf
