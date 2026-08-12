@@ -115,85 +115,123 @@ exports.main = async function(event, context, callback) {
 		return respond(404, {},  "Specified campaign does not exist.", false);
 	}
 
-	console.log(`[+] Campaign ${campaignId} is associated with SFR ${campaign.spotFleetRequestId}`);
+	// Campaigns created before On-Demand support have no provisioningModel; they're spot.
+	const provisioningModel = campaign.provisioningModel ?? "spot";
+
+	console.log(`[+] Campaign ${campaignId} is a '${provisioningModel}' campaign associated with fleet ${campaign.spotFleetRequestId}`);
 
 	var ec2 = new aws.EC2({region: campaign.region});
 
+	// Used on every exit path below, successful or not: once the user has asked for a
+	// campaign to stop, it must not remain marked active.
+	const markCancelled = () => ddb.updateItem({
+		Key: {
+			userid: {S: entity},
+			keyid: {S: `campaigns:${campaignId}`}
+		},
+		TableName: "Campaigns",
+		AttributeUpdates: {
+			active: { Action: 'PUT', Value: { BOOL: false }},
+			status: { Action: 'PUT', Value: { S: "CANCELLED" }}
+		}
+	}).promise();
+
 	switch (campaign.status) {
 		case "STARTING":
-		case "RUNNING": 
+		case "RUNNING":
 
-			let sfr;
+			if (provisioningModel == "on-demand") {
 
-			try {
-				sfr = await ec2.describeSpotFleetRequests({
-					SpotFleetRequestIds: [campaign.spotFleetRequestId]
-				}).promise();
-			} catch(e) {
-
-				let update = await ddb.updateItem({
-					Key: {
-						userid: {S: entity},
-						keyid: {S: `campaigns:${campaignId}`}
-					},
-					TableName: "Campaigns",
-					AttributeUpdates: {
-						active: { Action: 'PUT', Value: { BOOL: false }},
-						status: { Action: 'PUT', Value: { S: "CANCELLED" }}
-					}
-				}).promise();
-
-				console.log("Failed to retrieve spot fleet request.", e);
-				return respond(500, {}, "Failed to retrieve spot fleet request.", false);
-			}
-
-			if (!sfr.SpotFleetRequestConfigs?.[0]?.SpotFleetRequestId) {
-
-				let update = await ddb.updateItem({
-					Key: {
-						userid: {S: entity},
-						keyid: {S: `campaigns:${campaignId}`}
-					},
-					TableName: "Campaigns",
-					AttributeUpdates: {
-						active: { Action: 'PUT', Value: { BOOL: false }},
-						status: { Action: 'PUT', Value: { S: "CANCELLED" }}
-					}
-				}).promise();
-
-				return respond(404, "Error retrieving spot fleet data: not found.", false);
-			}
-
-			if (sfr.SpotFleetRequestConfigs[0].SpotFleetRequestState == "active") {
-				let cancellation;
+				let fleet;
 
 				try {
-					cancellation = await ec2.cancelSpotFleetRequests({
-						SpotFleetRequestIds: [sfr.SpotFleetRequestConfigs[0].SpotFleetRequestId],
-						TerminateInstances: true
+					fleet = await ec2.describeFleets({
+						FleetIds: [campaign.spotFleetRequestId]
 					}).promise();
 				} catch(e) {
-					console.log("Failed to request cancellation of spot fleet request.", e);
-					return respond(500, {}, "Failed to request cancellation of spot fleet request.", false);
+					await markCancelled();
+
+					console.log("Failed to retrieve EC2 fleet.", e);
+					return respond(500, {}, "Failed to retrieve EC2 fleet.", false);
 				}
 
-				if (cancellation?.SuccessfulFleetRequests?.[0].CurrentSpotFleetRequestState?.indexOf('cancelled') < 0) {
-					return respond(400, "Error cancelling spot fleet. Current state: " + cancallation.SuccessfulFleetRequests[0].CurrentSpotFleetRequestState, false);
+				if (!fleet.Fleets?.[0]?.FleetId) {
+					await markCancelled();
+
+					return respond(404, {}, "Error retrieving EC2 fleet data: not found.", false);
+				}
+
+				// Anything not already winding down needs an explicit deletion.
+				if (["submitted", "active", "modifying"].indexOf(fleet.Fleets[0].FleetState) > -1) {
+					let deletion;
+
+					try {
+						deletion = await ec2.deleteFleets({
+							FleetIds: [fleet.Fleets[0].FleetId],
+							TerminateInstances: true
+						}).promise();
+					} catch(e) {
+						console.log("Failed to request deletion of EC2 fleet.", e);
+						return respond(500, {}, "Failed to request deletion of EC2 fleet.", false);
+					}
+
+					if (deletion?.UnsuccessfulFleetDeletions?.length > 0) {
+						console.log("Error deleting EC2 fleet.", JSON.stringify(deletion.UnsuccessfulFleetDeletions));
+						return respond(400, {}, "Error deleting EC2 fleet: " + deletion.UnsuccessfulFleetDeletions[0]?.Error?.Message, false);
+					}
+				}
+
+				// The per-campaign launch template is dead weight once the fleet is gone.
+				await ec2.deleteLaunchTemplate({
+					LaunchTemplateName: `npk-${campaignId}`
+				}).promise().catch((e) => {
+					if (e.code != "InvalidLaunchTemplateName.NotFoundException") {
+						console.log(`[-] Unable to delete launch template for campaign ${campaignId}.`, e);
+					}
+				});
+
+			} else {
+
+				let sfr;
+
+				try {
+					sfr = await ec2.describeSpotFleetRequests({
+						SpotFleetRequestIds: [campaign.spotFleetRequestId]
+					}).promise();
+				} catch(e) {
+					await markCancelled();
+
+					console.log("Failed to retrieve spot fleet request.", e);
+					return respond(500, {}, "Failed to retrieve spot fleet request.", false);
+				}
+
+				if (!sfr.SpotFleetRequestConfigs?.[0]?.SpotFleetRequestId) {
+					await markCancelled();
+
+					return respond(404, {}, "Error retrieving spot fleet data: not found.", false);
+				}
+
+				if (sfr.SpotFleetRequestConfigs[0].SpotFleetRequestState == "active") {
+					let cancellation;
+
+					try {
+						cancellation = await ec2.cancelSpotFleetRequests({
+							SpotFleetRequestIds: [sfr.SpotFleetRequestConfigs[0].SpotFleetRequestId],
+							TerminateInstances: true
+						}).promise();
+					} catch(e) {
+						console.log("Failed to request cancellation of spot fleet request.", e);
+						return respond(500, {}, "Failed to request cancellation of spot fleet request.", false);
+					}
+
+					if (cancellation?.SuccessfulFleetRequests?.[0].CurrentSpotFleetRequestState?.indexOf('cancelled') < 0) {
+						return respond(400, {}, "Error cancelling spot fleet. Current state: " + cancellation.SuccessfulFleetRequests[0].CurrentSpotFleetRequestState, false);
+					}
 				}
 			}
 
 			try {
-				let update = await ddb.updateItem({
-					Key: {
-						userid: {S: entity},
-						keyid: {S: `campaigns:${campaignId}`}
-					},
-					TableName: "Campaigns",
-					AttributeUpdates: {
-						active: { Action: 'PUT', Value: { BOOL: false }},
-						status: { Action: 'PUT', Value: { S: "CANCELLED" }}
-					}
-				}).promise();
+				await markCancelled();
 			} catch(e) {
 				console.log("Failed to deactivate campaign.", e);
 				return respond(500, {}, "Failed to deactivate campaign.", false);
@@ -258,10 +296,6 @@ exports.main = async function(event, context, callback) {
 
 		break;
 	}
-
-	
-
-	return respond(200, {}, { msg: "Campaign started successfully", campaignId: campaignId, spotFleetRequestId: spotFleetRequest.SpotFleetRequestId }, true);
 }
 
 function respond(statusCode, headers, body, success) {

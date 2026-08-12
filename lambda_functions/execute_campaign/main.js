@@ -71,6 +71,10 @@ exports.main = async function(event, context, callback) {
 				});
 			}));
 		}
+
+		// Everything downstream builds launch targets out of this map. Without the await it
+		// was only populated by luck, via the unrelated awaits that happen to follow.
+		await Promise.all(promises);
 	} catch (e) {
 		console.log(e);
 		return callback(`[!] Failed to retrieve subnets for VPC: ${e}`);
@@ -241,14 +245,21 @@ exports.main = async function(event, context, callback) {
 
     console.log(imageFilters);
 
+	// Campaigns created before On-Demand support have no provisioningModel; they're spot.
+	const provisioningModel = manifest.provisioningModel ?? "spot";
+
+	console.log(`[*] Executing campaign ${campaignId} with the '${provisioningModel}' provisioning model.`);
+
 	try {
 		[pricing, image] = await Promise.all([
-			ec2.describeSpotPriceHistory({
-				EndTime: Math.round(Date.now() / 1000),
-				ProductDescriptions: [ "Linux/UNIX (Amazon VPC)" ],
-				InstanceTypes: [ manifest.instanceType ],
-				StartTime: Math.round(Date.now() / 1000)
-			}).promise(),
+			(provisioningModel == "on-demand") ?
+				getOnDemandPrice(manifest.instanceType, manifest.region) :
+				ec2.describeSpotPriceHistory({
+					EndTime: Math.round(Date.now() / 1000),
+					ProductDescriptions: [ "Linux/UNIX (Amazon VPC)" ],
+					InstanceTypes: [ manifest.instanceType ],
+					StartTime: Math.round(Date.now() / 1000)
+				}).promise(),
 
 			ec2.describeImages({
 				Filters: imageFilters
@@ -257,6 +268,17 @@ exports.main = async function(event, context, callback) {
 	} catch (e) {
 		console.log("Failed to retrieve price and image details.", e);
 		return respond(500, {}, "Failed to retrieve price and image details.", false);
+	}
+
+	// Normalise both models down to a single per-instance hourly rate. For spot this is the
+	// average across the region's AZs; for On-Demand it's the published rate.
+	const hourlyRate = (provisioningModel == "on-demand") ?
+		pricing :
+		pricing.SpotPriceHistory.reduce((average, entry) => average + (entry.SpotPrice / pricing.SpotPriceHistory.length), 0);
+
+	if (!hourlyRate || !isFinite(hourlyRate)) {
+		console.log(`Unable to determine an hourly rate for ${manifest.instanceType} in ${manifest.region}.`);
+		return respond(500, {}, "Unable to determine an hourly rate for the requested instance.", false);
 	}
 
 	console.log(image);
@@ -270,21 +292,27 @@ exports.main = async function(event, context, callback) {
 		return respond(500, {}, "Unable to find a suitable AMI.", false);
 	}
 
+	// Calculate the necessary volume size
+
+	const volumeSize = (Math.ceil(manifest.wordlistSize / 1073741824) * 2) + 1;
+	console.log(`Wordlist is ${manifest.wordlistSize / 1073741824}GiB. Allocating ${volumeSize}GiB`);
+
+	const instance_userdata = new Buffer.from(fs.readFileSync(__dirname + '/userdata.sh', 'utf-8')
+		.replace("{{APIGATEWAY}}", process.env.apigateway)
+		.replace("{{MANIFESTPATH}}", `${entity}/campaigns/${campaignId}`))
+		.toString('base64');
+
+	// The lower of the user's target and the deployment-wide ceiling. This is the number the
+	// monitor enforces against, and the number that bounds how long the fleet may live.
+	const maxCost = Math.min(parseFloat(manifest.priceTarget), parseFloat(variables.campaign_max_price));
+
 	let spotFleetParams;
 
+	// On-Demand campaigns don't use a spot fleet request, so skip building one entirely.
+	if (provisioningModel != "on-demand") {
 	try {
 
-		// Calculate the necessary volume size
-
-		const volumeSize = (Math.ceil(manifest.wordlistSize / 1073741824) * 2) + 1;
-		console.log(`Wordlist is ${manifest.wordlistSize / 1073741824}GiB. Allocating ${volumeSize}GiB`);
-
 		// Build a launchSpecification for each AZ in the target region.
-
-		const instance_userdata = new Buffer.from(fs.readFileSync(__dirname + '/userdata.sh', 'utf-8')
-			.replace("{{APIGATEWAY}}", process.env.apigateway)
-			.replace("{{MANIFESTPATH}}", `${entity}/campaigns/${campaignId}`))
-			.toString('base64');
 
 		const launchSpecificationTemplate = {
             ImageId: image.ImageId,
@@ -313,7 +341,7 @@ exports.main = async function(event, context, callback) {
 				ResourceType: "instance",
 				Tags: [{
 					Key: "MaxCost",
-					Value: ((manifest.priceTarget < variables.campaign_max_price) ? manifest.priceTarget : variables.campaign_max_price).toString()
+					Value: maxCost.toString()
 				}]
 			}],
             UserData: instance_userdata
@@ -368,11 +396,9 @@ exports.main = async function(event, context, callback) {
 			return specs.concat(az);
 		}, []);
 
-		// Get the average spot price across all AZs in the region.
-		const spotPrice = pricing.SpotPriceHistory.reduce((average, entry) => average + (entry.SpotPrice / pricing.SpotPriceHistory.length), 0);
-		const maxDuration = (Number(manifest.instanceDuration) < variables.campaign_max_price / spotPrice) ? Number(manifest.instanceDuration) : variables.campaign_max_price / spotPrice;
+		const maxDuration = (Number(manifest.instanceDuration) < variables.campaign_max_price / hourlyRate) ? Number(manifest.instanceDuration) : variables.campaign_max_price / hourlyRate;
 
-		console.log(`Setting Duration to ${maxDuration} (Spot average $${spotPrice} with limit of $${variables.campaign_max_price})`);
+		console.log(`Setting Duration to ${maxDuration} (Spot average $${hourlyRate} with limit of $${variables.campaign_max_price})`);
 
 		spotFleetParams = {
 			SpotFleetRequestConfig: {
@@ -395,25 +421,195 @@ exports.main = async function(event, context, callback) {
 		console.log("Failed to generate launch specifications.", e);
 		return respond(500, {}, "Failed to generate launch specifications.", false);
 	}
+	}
 
-	let spotFleetRequest;
+	// 'requestId' is the fleet handle NPK tracks the campaign by, regardless of model.
+	// For On-Demand campaigns it's an EC2 Fleet ID; for spot it's a Spot Fleet Request ID.
+	let requestId, launchTemplateId;
 
-	try {
-		spotFleetRequest = await ec2.requestSpotFleet(spotFleetParams).promise();
-	} catch (e) {
-		console.log("Failed to request spot fleet.", e);
-		return respond(500, {}, "Failed to request spot fleet.", false);
+	if (provisioningModel == "on-demand") {
+
+		// EC2 Fleet launches exclusively from launch templates, so each campaign gets its own.
+		// It's torn down alongside the fleet by the monitor or by delete_campaign.
+		const launchTemplateName = `npk-${campaignId}`;
+
+		try {
+			const launchTemplate = await ec2.createLaunchTemplate({
+				LaunchTemplateName: launchTemplateName,
+				LaunchTemplateData: {
+					ImageId: image.ImageId,
+					KeyName: "npk-key",
+					InstanceType: manifest.instanceType,
+					BlockDeviceMappings: [{
+						DeviceName: '/dev/xvdb',
+						Ebs: {
+							DeleteOnTermination: true,
+							Encrypted: false,
+							VolumeSize: volumeSize,
+							VolumeType: "gp2"
+						}
+					}],
+					IamInstanceProfile: {
+						Arn: variables.instanceProfile
+					},
+
+					// Fleets only propagate instance tags declared in the launch template.
+					// 'HourlyRate' lets the monitor cost the campaign without calling Pricing.
+					TagSpecifications: [{
+						ResourceType: "instance",
+						Tags: [{
+							Key: "MaxCost",
+							Value: maxCost.toString()
+						}, {
+							Key: "HourlyRate",
+							Value: hourlyRate.toString()
+						}, {
+							Key: "CampaignId",
+							Value: campaignId
+						}]
+					}],
+					UserData: instance_userdata
+				},
+				TagSpecifications: [{
+					ResourceType: "launch-template",
+					Tags: [{
+						Key: "CampaignId",
+						Value: campaignId
+					}]
+				}]
+			}).promise();
+
+			launchTemplateId = launchTemplate.LaunchTemplate.LaunchTemplateId;
+
+			console.log(`[+] Created launch template ${launchTemplateId} for campaign ${campaignId}`);
+		} catch (e) {
+			console.log("Failed to create launch template.", e);
+			return respond(500, {}, "Failed to create launch template.", false);
+		}
+
+		// Bound the fleet's lifetime by whichever runs out first: the requested duration, or
+		// the point at which the whole fleet would burn through the campaign's cost ceiling.
+		const instanceCount = parseInt(manifest.instanceCount);
+		const costLimitedDuration = maxCost / (hourlyRate * instanceCount);
+		const maxDuration = Math.min(Number(manifest.instanceDuration), costLimitedDuration);
+
+		console.log(`Setting Duration to ${maxDuration} (On-Demand $${hourlyRate}/hr x ${instanceCount} with limit of $${maxCost})`);
+
+		// A fleet whose budget buys less than a minute of runtime can't accomplish anything,
+		// and EC2 rejects a ValidUntil that's already passed. Fail with something readable.
+		if (maxDuration < (1 / 60)) {
+			await deleteLaunchTemplateQuietly(ec2, launchTemplateId);
+
+			console.log(`Campaign budget of $${maxCost} buys ${maxDuration} hours at $${hourlyRate}/hr x ${instanceCount}.`);
+			return respond(400, {}, `Campaign price limit of $${maxCost} is too low to run ${instanceCount} x ${manifest.instanceType} On-Demand at $${hourlyRate}/hr.`, false);
+		}
+
+		const subnets = variables.availabilityZones?.[manifest.region] ?? {};
+
+		// A manifest can name a region that's since been dropped from the deployment. Catch
+		// it here rather than throwing out of the handler, which would strand the launch
+		// template created moments ago with no response ever sent to the caller.
+		if (!Object.keys(subnets).length) {
+			await deleteLaunchTemplateQuietly(ec2, launchTemplateId);
+
+			console.log(`No subnets are known for region ${manifest.region}.`);
+			return respond(400, {}, `No usable subnets in ${manifest.region}. The region may no longer be part of this deployment.`, false);
+		}
+
+		const fleetParams = {
+			LaunchTemplateConfigs: [{
+				LaunchTemplateSpecification: {
+					LaunchTemplateId: launchTemplateId,
+					Version: "$Latest"
+				},
+
+				// One override per AZ lets the fleet fall back when a subnet is out of capacity.
+				Overrides: Object.keys(subnets).map((az) => ({
+					SubnetId: subnets[az]
+				}))
+			}],
+			TargetCapacitySpecification: {
+				TotalTargetCapacity: instanceCount,
+				OnDemandTargetCapacity: instanceCount,
+				DefaultTargetCapacityType: "on-demand"
+			},
+			OnDemandOptions: {
+				AllocationStrategy: "lowest-price"
+			},
+			Type: "request",
+
+			// This pair is the runaway protection that survives a management-plane failure:
+			// EC2 itself terminates the instances when the fleet expires.
+			TerminateInstancesWithExpiration: true,
+			ValidFrom: new Date(),
+			ValidUntil: new Date(new Date().getTime() + (maxDuration * 3600 * 1000)),
+
+			TagSpecifications: [{
+				ResourceType: "fleet",
+				Tags: [{
+					Key: "Name",
+					Value: launchTemplateName
+				}, {
+					Key: "CampaignId",
+					Value: campaignId
+				}, {
+					Key: "MaxCost",
+					Value: maxCost.toString()
+				}, {
+					Key: "HourlyRate",
+					Value: hourlyRate.toString()
+				}]
+			}]
+		};
+
+		console.log(JSON.stringify(fleetParams));
+
+		let fleet;
+
+		try {
+			fleet = await ec2.createFleet(fleetParams).promise();
+		} catch (e) {
+			console.log("Failed to create EC2 fleet.", e);
+
+			// Don't strand the template if the fleet never came up.
+			await deleteLaunchTemplateQuietly(ec2, launchTemplateId);
+
+			return respond(500, {}, "Failed to create EC2 fleet.", false);
+		}
+
+		requestId = fleet.FleetId;
+
+		console.log(`Successfully requested EC2 fleet ${requestId}`);
+
+	} else {
+
+		let spotFleetRequest;
+
+		try {
+			spotFleetRequest = await ec2.requestSpotFleet(spotFleetParams).promise();
+		} catch (e) {
+			console.log("Failed to request spot fleet.", e);
+			return respond(500, {}, "Failed to request spot fleet.", false);
+		}
+
+		requestId = spotFleetRequest.SpotFleetRequestId;
+
+		console.log(`Successfully requested spot fleet ${requestId}`);
 	}
 
 	// Campaign created successfully.
-
-	console.log(`Successfully requested spot fleet ${spotFleetRequest.SpotFleetRequestId}`);
 
 	try {
 		const updateParams = aws.DynamoDB.Converter.marshall({
 			active: true,
 			status: "STARTING",
-			spotFleetRequestId: spotFleetRequest.SpotFleetRequestId,
+
+			// Keyed by the 'SpotFleetRequests' GSI for both models; holds an EC2 Fleet ID
+			// when the campaign is On-Demand.
+			spotFleetRequestId: requestId,
+			provisioningModel,
+			launchTemplateId: launchTemplateId ?? "<none>",
+			hourlyRate: hourlyRate.toString(),
 			startTime: Math.floor(new Date().getTime() / 1000),
 			eventType: "CampaignStarted",
 			lastuntil: 0,
@@ -436,11 +632,69 @@ exports.main = async function(event, context, callback) {
 			
 		}).promise();
 	} catch (e) {
-		console.log("Spot fleet submitted, but failed to mark Campaign as 'STARTING'. This is a catastrophic error.", e);
-		return respond(500, {}, "Spot fleet submitted, but failed to mark Campaign as 'STARTING'. This is a catastrophic error.", false);
+		console.log("Fleet submitted, but failed to mark Campaign as 'STARTING'. This is a catastrophic error.", e);
+		return respond(500, {}, "Fleet submitted, but failed to mark Campaign as 'STARTING'. This is a catastrophic error.", false);
 	}
 
-	return respond(200, {}, { msg: "Campaign started successfully", campaignId: campaignId, spotFleetRequestId: spotFleetRequest.SpotFleetRequestId }, true);
+	return respond(200, {}, { msg: "Campaign started successfully", campaignId: campaignId, spotFleetRequestId: requestId }, true);
+}
+
+// Used on every abort path after the template exists. Cleanup failing must never mask the
+// error that caused the abort, so this only ever logs.
+function deleteLaunchTemplateQuietly(ec2, launchTemplateId) {
+	return ec2.deleteLaunchTemplate({ LaunchTemplateId: launchTemplateId }).promise()
+		.catch((e) => console.log(`[-] Also failed to clean up launch template ${launchTemplateId}.`, e));
+}
+
+// Resolve the published On-Demand rate for an instance type from the Pricing API. The API is
+// only served from a handful of regions, so it's always queried against us-east-1.
+async function getOnDemandPrice(instanceType, region) {
+
+	const pricingApi = new aws.Pricing({ region: "us-east-1", apiVersion: "2017-10-15" });
+
+	const products = await pricingApi.getProducts({
+		ServiceCode: "AmazonEC2",
+		Filters: [
+			{ Type: "TERM_MATCH", Field: "instanceType", Value: instanceType },
+			{ Type: "TERM_MATCH", Field: "regionCode", Value: region },
+			{ Type: "TERM_MATCH", Field: "operatingSystem", Value: "Linux" },
+			{ Type: "TERM_MATCH", Field: "tenancy", Value: "Shared" },
+			{ Type: "TERM_MATCH", Field: "preInstalledSw", Value: "NA" },
+			{ Type: "TERM_MATCH", Field: "capacitystatus", Value: "Used" }
+		],
+		MaxResults: 10
+	}).promise();
+
+	if (!products.PriceList?.length) {
+		throw new Error(`No On-Demand price found for ${instanceType} in ${region}`);
+	}
+
+	// PriceList entries are JSON-encoded strings of the shape:
+	//   terms.OnDemand.<offerCode>.priceDimensions.<rateCode>.pricePerUnit.USD
+	const price = products.PriceList
+		.map(entry => (typeof entry == "string") ? JSON.parse(entry) : entry)
+		.reduce((cheapest, product) => {
+			Object.values(product?.terms?.OnDemand ?? {}).forEach((offer) => {
+				Object.values(offer?.priceDimensions ?? {}).forEach((dimension) => {
+					const usd = parseFloat(dimension?.pricePerUnit?.USD);
+
+					// Free-tier and $0 dimensions aren't the rate we're looking for.
+					if (!!usd && (cheapest === null || usd < cheapest)) {
+						cheapest = usd;
+					}
+				});
+			});
+
+			return cheapest;
+		}, null);
+
+	if (price === null) {
+		throw new Error(`Unable to parse an On-Demand rate for ${instanceType} in ${region}`);
+	}
+
+	console.log(`[+] On-Demand rate for ${instanceType} in ${region} is $${price}/hr`);
+
+	return price;
 }
 
 function respond(statusCode, headers, body, success) {

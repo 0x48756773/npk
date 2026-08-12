@@ -15,7 +15,42 @@ aws.config.update({region: settings.region});
 
 const db = new aws.DynamoDB();
 
+// How long an On-Demand fleet may hold zero instances before it's considered to have
+// failed to obtain capacity. Generous: On-Demand capacity resolves in seconds, so this
+// only has to clear the gap between createFleet returning and instances appearing.
+const NEVER_LAUNCHED_GRACE_MS = 15 * 60 * 1000;
+
 exports.main = async function(event, context, callback) {
+
+	// Spot and On-Demand campaigns are tracked through entirely different EC2 APIs, so each
+	// gets its own pass. They're independent: a failure in one must not mask the other, or
+	// leave the other's cost ceiling unenforced.
+	const passes = ["spot", "on-demand"];
+	const results = await Promise.allSettled([
+		processSpotFleets(),
+		processOnDemandFleets()
+	]);
+
+	const messages = results.map((result, i) => {
+		if (result.status == "rejected") {
+			console.log(`[!] ${passes[i]} pass failed:`, result.reason);
+			return `[!] ${passes[i]} pass failed: ${result.reason}`;
+		}
+
+		return result.value;
+	});
+
+	const summary = messages.join(' ');
+
+	// Surface failures to the caller so the DLQ/SNS alarm path still fires.
+	if (results.some(result => result.status == "rejected")) {
+		return callback(summary);
+	}
+
+	return callback(null, summary);
+};
+
+async function processSpotFleets() {
 
 	let spotFleets = {};
 	let promises = [];
@@ -51,14 +86,14 @@ exports.main = async function(event, context, callback) {
 		await Promise.all(promises);
 
 		if (!Object.keys(spotFleets).length) {
-			return callback(null, "[*] No spot fleets to process.");
+			return "[*] No spot fleets to process.";
 		} else {
 			console.log(`[+] Found ${Object.keys(spotFleets).length} SFRs to process.`);
 		}
 
 	} catch (e) {
 		console.log(e);
-		return callback(`[!] Failed to retreive spot fleets and history: ${e}`);
+		throw new Error(`[!] Failed to retreive spot fleets and history: ${e}`);
 	}
 
 	promises = [];
@@ -101,7 +136,7 @@ exports.main = async function(event, context, callback) {
 
 	} catch (e) {
 		console.log(e);
-		return callback(`[!] Failed to retreive spot instance statuses: ${e}`);
+		throw new Error(`[!] Failed to retreive spot instance statuses: ${e}`);
 	}
 
 	promises = [];
@@ -147,7 +182,7 @@ exports.main = async function(event, context, callback) {
 		});
 	} catch (e) {
 		console.log(e);
-		return callback(`[!] Failed to handle exhausted campaigns: ${e}`);
+		throw new Error(`[!] Failed to handle exhausted campaigns: ${e}`);
 	}
 
 	promises = [];
@@ -176,7 +211,7 @@ exports.main = async function(event, context, callback) {
 				}).then((data) => {
 					console.log(`[+] Marked campaign of ${fleet.SpotFleetRequestId} as ${fleetState}`);
 				}, (e) => {
-					console.log(`[!] Failed attempting to update ${promiseDetails.fleets[fleetId].SpotFleetRequestId}`);
+					console.log(`[!] Failed attempting to update ${fleet.SpotFleetRequestId}`);
 				}));
 
 				if (fleet.SpotFleetRequestState == "cancelled") {
@@ -272,7 +307,7 @@ exports.main = async function(event, context, callback) {
 
 	} catch (e) {
 		console.log(e);
-		return callback(`[!] Failed to get instance history and prices: ${e}`);
+		throw new Error(`[!] Failed to get instance history and prices: ${e}`);
 	}
 
 	promises = [];
@@ -295,7 +330,7 @@ exports.main = async function(event, context, callback) {
 					badInstance = true;
 					return false;
 				}
-				
+
 				prices[new Date().getTime()] = prices[Object.keys(prices).slice(-1)];
 
 				const timestamps = Object.keys(prices).sort(function(a, b) { return a - b; });
@@ -403,11 +438,349 @@ exports.main = async function(event, context, callback) {
 
 	} catch (e) {
 		console.log(e);
-		return callback(`[!] Failed to update spot instance costs: ${e}`);
+		throw new Error(`[!] Failed to update spot instance costs: ${e}`);
 	}
 
-	return callback(null, `[+] Reviewed [${Object.keys(spotFleets).length}] SFRs.`);
+	return `[+] Reviewed [${Object.keys(spotFleets).length}] SFRs.`;
 };
+
+async function processOnDemandFleets() {
+
+	let fleets = {};
+
+	// Enumerate NPK-owned EC2 Fleets across all regions. describeFleets can't filter on tags,
+	// so everything is pulled and the CampaignId tag is matched here.
+	try {
+		await Promise.all(Object.keys(settings.regions).map(async (region) => {
+			const ec2 = new aws.EC2({ region });
+
+			for (const fleet of await getAllFleets(ec2)) {
+				const tags = tagsToMap(fleet.Tags);
+
+				if (!tags.CampaignId) {
+					continue;
+				}
+
+				// Skip fleets more than a day old, matching the spot pass. Deleted fleets
+				// linger in the API for a while after their instances are gone.
+				if (new Date(fleet.CreateTime).getTime() < new Date().getTime() - (1000 * 60 * 60 * 24)) {
+					console.log(`[-] ${fleet.FleetId} created more than a day ago. Skipping.`);
+					continue;
+				}
+
+				fleets[fleet.FleetId] = {
+					...fleet,
+					region,
+					tags,
+					history: await getFleetHistory(ec2, fleet.FleetId),
+					instances: {},
+					price: 0
+				};
+			}
+		}));
+
+		if (!Object.keys(fleets).length) {
+			return "[*] No On-Demand fleets to process.";
+		}
+
+		console.log(`[+] Found ${Object.keys(fleets).length} EC2 Fleets to process.`);
+
+	} catch (e) {
+		console.log(e);
+		throw new Error(`[!] Failed to retrieve On-Demand fleets: ${e}`);
+	}
+
+	// Associate instances with their fleets. EC2 Fleet stamps 'aws:ec2:fleet-id' on every
+	// instance it launches, and the launch template adds our own CampaignId/HourlyRate tags.
+	try {
+		await Promise.all(Object.keys(settings.regions).map(async (region) => {
+			const ec2 = new aws.EC2({ region });
+
+			for (const instance of await getAllFleetInstances(ec2)) {
+				const tags = tagsToMap(instance.Tags);
+				const fleetId = tags['aws:ec2:fleet-id'];
+
+				if (!fleetId || !fleets[fleetId]) {
+					continue;
+				}
+
+				const endTime = (["pending", "running"].indexOf(instance.State?.Name) > -1) ?
+					new Date().getTime() : getInstanceStopTime(instance);
+
+				fleets[fleetId].instances[instance.InstanceId] = {
+					// Shaped to match the spot pass so the dashboard renders both identically.
+					Status: {
+						Code: instance.State?.Name,
+						Message: instance.StateTransitionReason || instance.StateReason?.Message || ""
+					},
+					State: instance.State?.Name,
+					instanceType: instance.InstanceType,
+					availabilityZone: instance.Placement?.AvailabilityZone,
+					hourlyRate: parseFloat(tags.HourlyRate),
+					history: {
+						startTime: new Date(instance.LaunchTime).getTime(),
+						endTime
+					},
+					price: 0
+				};
+			}
+		}));
+	} catch (e) {
+		console.log(e);
+		throw new Error(`[!] Failed to retrieve On-Demand instance statuses: ${e}`);
+	}
+
+	const promises = [];
+
+	try {
+		for (const fleetId of Object.keys(fleets)) {
+			const fleet = fleets[fleetId];
+			const ec2 = new aws.EC2({ region: fleet.region });
+
+			const instanceCount = Object.keys(fleet.instances).length;
+			const isDeleted = /^deleted/.test(fleet.FleetState);
+			const fleetAge = new Date().getTime() - new Date(fleet.CreateTime).getTime();
+
+			console.log(`[+] Found ${instanceCount} instances for ${fleetId} (${fleet.FleetState})`);
+
+			const hasLiveInstances = Object.keys(fleet.instances).reduce((state, instanceId) => {
+				return (["pending", "running"].indexOf(fleet.instances[instanceId].State) > -1) ? true : state;
+			}, false);
+
+			// Cost is calculated before anything else so that enforcement below always has
+			// the best number available. On-Demand pricing is flat, so cost is just the rate
+			// multiplied by uptime; Linux bills per-second with a 60 second minimum.
+			let unpricedInstances = 0;
+
+			for (const instanceId of Object.keys(fleet.instances)) {
+				const instance = fleet.instances[instanceId];
+
+				if (!instance.hourlyRate || !instance.history.startTime) {
+					unpricedInstances++;
+					continue;
+				}
+
+				const seconds = Math.max(60, (instance.history.endTime - instance.history.startTime) / 1000);
+
+				instance.price = (seconds / 3600) * instance.hourlyRate;
+				fleet.price += instance.price;
+
+				console.log(`[*] Instance ${instanceId} up for ${seconds.toFixed(0)} seconds; estimated cost $${instance.price.toFixed(4)}`);
+			}
+
+			// An instance we can't price makes the total a lower bound, not a reason to stop
+			// enforcing. Skipping the ceiling because of one missing tag would leave the
+			// entire fleet uncapped, which is the opposite of what this function is for.
+			if (unpricedInstances > 0) {
+				console.log(`[!] Fleet ${fleetId} has ${unpricedInstances} instance(s) with no usable rate or launch time. Recorded cost is a lower bound.`);
+			}
+
+			// Nodes power themselves off when they finish; reap the fleet once they've all gone.
+			if (!!instanceCount && !hasLiveInstances && !isDeleted) {
+				promises.push(deleteFleet(ec2, fleetId).then(() => {
+					console.log(`[+] Deleted ${fleetId} because all of its instances have stopped.`);
+				}, (e) => {
+					console.log(`[-] Unable to delete exhausted fleet ${fleetId}.`, e);
+				}));
+			}
+
+			// A 'request' type fleet makes one attempt at capacity; On-Demand either has it
+			// or it doesn't, and the answer comes back in seconds. A fleet still holding zero
+			// instances well past launch is never going to get any, and without this it sits
+			// marked RUNNING until ValidUntil expires - potentially hours of a campaign that
+			// appears live and is doing nothing.
+			if (!instanceCount && !isDeleted && fleetAge > NEVER_LAUNCHED_GRACE_MS) {
+				console.log(`[!] Fleet ${fleetId} launched no instances within ${NEVER_LAUNCHED_GRACE_MS / 60000} minutes; deleting.`);
+
+				promises.push(deleteFleet(ec2, fleetId).then(() => {
+					console.log(`[+] Deleted ${fleetId} because it never obtained capacity.`);
+				}, (e) => {
+					console.log(`[-] Unable to delete never-launched fleet ${fleetId}.`, e);
+				}));
+			}
+
+			// A fully deleted fleet with nothing running is a finished campaign.
+			if (isDeleted && !hasLiveInstances) {
+				const fleetState = (fleet.FleetState == "deleted") ? "COMPLETED" : "STOPPING";
+
+				promises.push(editCampaignViaRequestId(fleetId, {
+					active: false,
+					price: fleet.price,
+					spotRequestHistory: fleet.history,
+					spotRequestStatus: fleet.instances,
+					status: fleetState
+				}).then(() => {
+					console.log(`[+] Marked campaign of ${fleetId} as ${fleetState}`);
+				}, (e) => {
+					console.log(`[!] Failed attempting to update ${fleetId}`, e);
+				}));
+
+				// The per-campaign launch template has no further use once the fleet is done.
+				promises.push(deleteLaunchTemplate(ec2, fleet.tags.CampaignId));
+
+				continue;
+			}
+
+			promises.push(editCampaignViaRequestId(fleetId, {
+				// A deleted fleet whose instances are still winding down is not an active
+				// campaign. Writing 'true' here would resurrect one the user just cancelled,
+				// because delete_campaign has already marked it inactive.
+				active: !isDeleted,
+				price: fleet.price,
+				spotRequestHistory: fleet.history,
+				spotRequestStatus: fleet.instances,
+				status: isDeleted ? "STOPPING" : "RUNNING"
+			}).then(() => {
+				console.log(`[+] Updated price of fleet ${fleetId}`);
+			}, (e) => {
+				console.log(`[!] Failed attempting to update price for ${fleetId}`, e);
+			}));
+
+			// Exceeding either limit trips the ceiling, so the effective limit is the lower
+			// of the two. A missing MaxCost tag leaves the deployment-wide limit in force.
+			const maxCost = parseFloat(fleet.tags.MaxCost);
+			const ceiling = Math.min(
+				isNaN(maxCost) ? Infinity : maxCost,
+				parseFloat(settings.campaign_max_price)
+			);
+
+			if (fleet.price > ceiling) {
+				const critical = fleet.price > ceiling * 1.1;
+
+				console.log(`Fleet ${fleetId} costs ${critical ? "CRITICALLY " : ""}exceed limits ($${fleet.price} > $${ceiling}); terminating.`);
+
+				if (critical) {
+					promises.push(criticalAlert(`EC2 Fleet ${fleetId} current price is: ${fleet.price}; Terminating.`));
+				}
+
+				// Issued once. Two concurrent deletes for the same fleet make the second one
+				// fail, raising a spurious "failed to terminate" alert during the exact
+				// incident where the alerting needs to be trustworthy.
+				if (!isDeleted) {
+					promises.push(deleteFleet(ec2, fleetId).then(() => {
+						console.log(`Successfully terminated ${fleetId}`);
+					}, (e) => {
+						console.log(e);
+						return criticalAlert(`Failed to terminate fleet ${fleetId} with cost $${fleet.price}`);
+					}));
+				}
+			}
+		}
+
+		await Promise.all(promises);
+
+	} catch (e) {
+		console.log(e);
+		throw new Error(`[!] Failed to update On-Demand instance costs: ${e}`);
+	}
+
+	return `[+] Reviewed [${Object.keys(fleets).length}] EC2 Fleets.`;
+};
+
+function tagsToMap(tags) {
+	return (tags ?? []).reduce((acc, tag) => {
+		acc[tag.Key] = tag.Value;
+
+		return acc;
+	}, {});
+}
+
+// Instances that are no longer running report when they stopped in StateTransitionReason,
+// e.g. "User initiated (2024-01-01 12:00:00 GMT)". Fall back to now, which over-estimates
+// cost rather than under-estimating it.
+function getInstanceStopTime(instance) {
+	const stamp = /\(([^)]+)\)/.exec(instance.StateTransitionReason ?? "")?.[1];
+	const parsed = !!stamp ? Date.parse(stamp.replace(' GMT', ' UTC')) : NaN;
+
+	return isNaN(parsed) ? new Date().getTime() : parsed;
+}
+
+async function getAllFleets(ec2, nextToken = null) {
+	const data = await ec2.describeFleets({ MaxResults: 100, NextToken: nextToken }).promise();
+	const fleets = data.Fleets ?? [];
+
+	if (!data.NextToken) {
+		return fleets;
+	}
+
+	return fleets.concat(await getAllFleets(ec2, data.NextToken));
+}
+
+// Every NPK On-Demand node carries a CampaignId tag from its launch template.
+async function getAllFleetInstances(ec2, nextToken = null) {
+	const data = await ec2.describeInstances({
+		Filters: [{
+			Name: "tag-key",
+			Values: ["CampaignId"]
+		}],
+		MaxResults: 100,
+		NextToken: nextToken
+	}).promise();
+
+	const instances = (data.Reservations ?? []).reduce((acc, reservation) => acc.concat(reservation.Instances ?? []), []);
+
+	if (!data.NextToken) {
+		return instances;
+	}
+
+	return instances.concat(await getAllFleetInstances(ec2, data.NextToken));
+}
+
+async function getFleetHistory(ec2, fleetId, nextToken = null) {
+	try {
+		const data = await ec2.describeFleetHistory({
+			FleetId: fleetId,
+			StartTime: new Date(new Date().getTime() - (1000 * 60 * 60 * 24)),
+			NextToken: nextToken
+		}).promise();
+
+		let history = (data.HistoryRecords ?? []).map((entry) => {
+			entry.Timestamp = new Date(entry.Timestamp).getTime() / 1000;
+
+			return entry;
+		});
+
+		if (!!data.NextToken) {
+			history = history.concat(await getFleetHistory(ec2, fleetId, data.NextToken));
+		}
+
+		return history;
+	} catch (e) {
+		// History is presentational only; never let it fail the costing pass.
+		console.log(`[-] Unable to retrieve history for ${fleetId}.`, e);
+		return [];
+	}
+}
+
+async function deleteFleet(ec2, fleetId) {
+	const result = await ec2.deleteFleets({
+		FleetIds: [fleetId],
+		TerminateInstances: true
+	}).promise();
+
+	if (result.UnsuccessfulFleetDeletions?.length) {
+		throw new Error(JSON.stringify(result.UnsuccessfulFleetDeletions));
+	}
+
+	return result;
+}
+
+function deleteLaunchTemplate(ec2, campaignId) {
+	if (!campaignId) {
+		return Promise.resolve();
+	}
+
+	return ec2.deleteLaunchTemplate({
+		LaunchTemplateName: `npk-${campaignId}`
+	}).promise().then(() => {
+		console.log(`[+] Deleted launch template for campaign ${campaignId}`);
+	}, (e) => {
+		// Already gone is the expected steady state after the first pass.
+		if (e.code != "InvalidLaunchTemplateName.NotFoundException") {
+			console.log(`[-] Unable to delete launch template for campaign ${campaignId}.`, e);
+		}
+	});
+}
 
 function criticalAlert(message) {
 	return new Promise((success, failure) => {
@@ -461,6 +834,8 @@ function editCampaign(entity, campaign, values) {
 	});
 }
 
+// Campaigns are indexed by the fleet handle that started them, which is a Spot Fleet Request
+// ID for spot campaigns and an EC2 Fleet ID for On-Demand ones.
 function editCampaignViaRequestId(spotFleetRequestId, values) {
 	return new Promise((success, failure) => {
 		db.query({
@@ -472,7 +847,7 @@ function editCampaignViaRequestId(spotFleetRequestId, values) {
 			TableName: "Campaigns"
 		}, function (err, data) {
 			if (err) {
-				return failure(cb("Error querying SpotFleetRequest table: " + err));
+				return failure(new Error("Error querying SpotFleetRequest table: " + err));
 			}
 
 			if (data.Items.length < 1) {
@@ -484,7 +859,7 @@ function editCampaignViaRequestId(spotFleetRequestId, values) {
 
 			editCampaign(data.userid, data.keyid.split(':').slice(1), values).then((updates) => {
 				success(updates);
-			});
+			}, failure);
 		});
 	});
 }
@@ -497,7 +872,7 @@ function getSpotRequestHistory(ec2, sfr, nextToken = null) {
 		StartTime: "1970-01-01T00:00:00Z",
 		NextToken: nextToken
 	}).promise().then((data) => {
-		
+
 		history = history.concat(data.HistoryRecords);
 
 		if (data.hasOwnProperty('NextToken')) {

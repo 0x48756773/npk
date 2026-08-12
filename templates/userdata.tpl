@@ -10,7 +10,13 @@ export USERDATAREGION=${userdataRegion}
 export TOKEN=`curl -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600"`
 export INSTANCEID=`wget "--header=X-aws-ec2-metadata-token: $TOKEN" -qO- http://169.254.169.254/latest/meta-data/instance-id`
 export REGION=`wget "--header=X-aws-ec2-metadata-token: $TOKEN" -qO- http://169.254.169.254/latest/meta-data/placement/availability-zone | sed 's/.$//'`
-aws ec2 describe-tags --region $REGION --filter "Name=resource-id,Values=$INSTANCEID" --output=text | sed -r 's/TAGS\t(.*)\t.*\t.*\t(.*)/\1="\2"/' | sed -r 's/aws:ec2spot:fleet-request-id/SpotFleet/' > ec2-tags
+# Spot Fleet and EC2 Fleet stamp the fleet handle under different tag keys; rename whichever
+# is present to a shell-safe name, then drop any remaining colon-bearing keys (AWS adds
+# 'aws:ec2launchtemplate:*' to On-Demand nodes) so they can't break the sourcing below.
+aws ec2 describe-tags --region $REGION --filter "Name=resource-id,Values=$INSTANCEID" --output=text \
+	| sed -r 's/TAGS\t(.*)\t.*\t.*\t(.*)/\1="\2"/' \
+	| sed -r -e 's/^aws:ec2spot:fleet-request-id/SpotFleet/' -e 's/^aws:ec2:fleet-id/Fleet/' \
+	| grep -v '^[^=]*:' > ec2-tags
 . ec2-tags
 
 # This is required for the wrapper to get anything done.
@@ -117,7 +123,15 @@ echo "* * * * * root /usr/local/bin/aws --region $USERDATAREGION s3 sync s3://$U
 echo "* * * * * root /usr/local/bin/aws --region $USERDATAREGION s3 sync /potfiles/ s3://$USERDATA/$ManifestPath/potfiles/ --include \"*$${INSTANCEID}*\" --include \"*benchmark-results*\"" >> /etc/crontab
 echo "* * * * * root /root/monitor_instance_action.sh" >> /etc/crontab
 
-aws ec2 describe-spot-fleet-instances --region $REGION --spot-fleet-request-id $SpotFleet | jq '.ActiveInstances[].InstanceId' | sort > fleet_instances
+# Each node works a slice of the keyspace determined by its position in the fleet, so this
+# enumeration has to succeed for either provisioning model. If it returns a single node when
+# there are really several, every node grinds the same slice.
+if [[ -n "$SpotFleet" ]]; then
+	aws ec2 describe-spot-fleet-instances --region $REGION --spot-fleet-request-id $SpotFleet | jq '.ActiveInstances[].InstanceId' | sort > fleet_instances
+else
+	aws ec2 describe-fleet-instances --region $REGION --fleet-id $Fleet | jq '.ActiveInstances[].InstanceId' | sort > fleet_instances
+fi
+
 export INSTANCECOUNT=$(cat fleet_instances | wc -l)
 export INSTANCENUMBER=$(cat fleet_instances | grep -nr $INSTANCEID - | cut -d':' -f1)
 

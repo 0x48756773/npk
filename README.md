@@ -38,17 +38,27 @@ Take the guess-work out of your campaigns. See how far you'll get and how much i
 
 ![coverage](https://user-images.githubusercontent.com/143415/156901016-a63b2ea1-fcf0-4a48-99c5-a1c6ab2e3221.png)
 
-### 4. Max price enforcement and runaway instance protection
+### 4. Spot or On-Demand provisioning
+
+Pick how each campaign is provisioned right in the campaign builder. **Spot** is the cheapest way to crack and is the right default, but AWS can reclaim the instances at any time and end your campaign early. **On-Demand** costs more per hour and cannot be interrupted, which matters when a campaign has to finish on a schedule.
+
+Prices, quotas, and available instance sizes all update to match the model you select.
+
+**Note:** Spot and On-Demand draw on *separate* AWS service quotas. A healthy Spot quota tells you nothing about your On-Demand quota, which is zero by default on many accounts. Check the 'Quota' page in the NPK console before planning an On-Demand campaign, and request an increase to *Running On-Demand G and VT instances* (or *Running On-Demand P instances*) if you need one.
+
+### 5. Max price enforcement and runaway instance protection
 
 GPU instances are expensive. Runaway GPU instances are EXTREMELY expensive. NPK will enforce a maximum campaign price limit, and was designed to prevent runaway instances even with a complete failure of the management plane.
 
-### 5. Multi-Tenancy & SAML-based single sign-on
+On-Demand campaigns are launched as EC2 Fleets with an expiry attached, so AWS itself terminates the instances when the campaign's time or budget runs out &mdash; even if every Lambda in the account stops running.
+
+### 6. Multi-Tenancy & SAML-based single sign-on
 
 NPK supports multiple users, with strict separation of data, campaigns, and results between each user. It can optionally integrate with SAML-based federated identity providers to enable large teams to use NPK with minimal effort.
 
 ![user_administration](https://user-images.githubusercontent.com/143415/156901873-6c89bb50-5268-4382-aebd-e45ee5ff2f9f.png)
 
-### 6. Data lifecycle management
+### 7. Data lifecycle management
 
 Configure how long data will stay in NPK with configurable lifecycle durations during installation. Hashfiles and results are automatically removed after this much time to keep things nicely cleaned up.
 

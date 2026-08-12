@@ -130,13 +130,18 @@
                             </div>
                             <div ng-if="campaign.spotRequestHistory.slice(-1)[0].EventType == 'error'">
                               <h6 class="card-text text-white">
-                                AWS raised an error while fulfilling your spot fleet request.<br />
+                                AWS raised an error while fulfilling your
+                                {{ campaign.provisioningModel == 'on-demand' ? 'EC2 fleet request' : 'spot fleet request' }}.<br />
                               </h6>
                               <small class="ml-3 text-white">
                                 [{{ campaign.spotRequestHistory.slice(-1)[0].EventInformation.EventSubType }}]: {{ campaign.spotRequestHistory.slice(-1)[0].EventInformation.EventDescription }}
-                                <p class="mt-1">
+                                <p class="mt-1" ng-if="campaign.provisioningModel != 'on-demand'">
                                   <b>NPK Note</b>: Spot capacity issues are increasingly common in AWS due to the global chip shortage.
-                                  <br />Try using a different GPU instance family or running your campaign in a different region.
+                                  <br />Try using a different GPU instance family, running your campaign in a different region, or switching to On-Demand.
+                                </p>
+                                <p class="mt-1" ng-if="campaign.provisioningModel == 'on-demand'">
+                                  <b>NPK Note</b>: On-Demand capacity is not guaranteed either. Try a different GPU instance
+                                  family or region, and confirm your On-Demand vCPU quota covers this campaign.
                                 </p>
                               </small>
                             </div>
@@ -176,9 +181,9 @@
                                <div class="row">
                                  <div class="col-lg-12 text-center p-0 pb-2 mb-2">
                                   <small ng-if="node['latest'].startTime" class="mb-2">
-                                    Spot Status: [ {{ campaigns[campaign._id].spotRequestStatus[nid].State }}; {{ campaigns[campaign._id].spotRequestStatus[nid].Status.Code }} ]
+                                    {{ campaign.provisioningModel == 'on-demand' ? 'Instance' : 'Spot' }} Status: [ {{ campaigns[campaign._id].spotRequestStatus[nid].State }}; {{ campaigns[campaign._id].spotRequestStatus[nid].Status.Code }} ]
                                     &nbsp;&nbsp;&nbsp;
-                                    Spot Fulfillment Message: [ {{ campaigns[campaign._id].spotRequestStatus[nid].Status.Message.split(':').pop() }} ]
+                                    {{ campaign.provisioningModel == 'on-demand' ? 'Instance' : 'Spot Fulfillment' }} Message: [ {{ campaigns[campaign._id].spotRequestStatus[nid].Status.Message.split(':').pop() }} ]
                                     <br/>
                                     Hashcat: {{ node['latest'].progress | number:2 }}% | 
                                     Time: {{ ((node.last - campaign.startTime) / campaign.durationSeconds) * 100 | number:2 }}% | 
