@@ -35,6 +35,17 @@ and the `ENVVARS` files do not exist in a fresh clone — they appear at deploy.
 the shape of these files requires a full `npm run deploy` / `npm run update`, **not** an
 `aws s3 sync` of `site-content/`.
 
+### CloudShell bootstrap
+
+`cloudshell_install.sh` lives in the repo and is fetched directly from GitHub raw rather
+than from `npkproject.io`, so the installer and the code it deploys are always the same
+revision. Repo, branch and target directory come from `NPK_REPO` / `NPK_BRANCH` / `NPK_DIR`,
+which replaces the old practice of maintaining a separate `cloudshell_install_dev.sh`.
+
+The script is **sourced, not executed** — it sets `PS1` and leaves the shell inside the repo
+directory. It therefore must never call `exit` or `set -e`; either would kill the user's
+CloudShell session. Failure paths `return` instead.
+
 ### Campaign lifecycle
 
 ```
