@@ -24,6 +24,7 @@ angular.module('app')
 	.constant('FAMILYREGIONS', ${familyRegions})
 	.constant('FAMILIES', ${families})
 	.constant('QUOTAS', ${quotas})
+	.constant('ONDEMANDPRICES', ${onDemandPrices})
 	.constant('REGIONS', ${regions})
 	.constant('USERDATA_BUCKET', {
 		name: "${userdata_bucket}",

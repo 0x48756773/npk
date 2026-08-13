@@ -16,11 +16,19 @@ Let's face it - even the beastliest cracking rig spends a lot of time at idle. Y
 
 Paste a one-liner into AWS CloudShell. Pretty easy.
 
-```source <(curl https://npkproject.io/cloudshell_install.sh)```
+```source <(curl -sL https://raw.githubusercontent.com/0x48756773/npk/main/cloudshell_install.sh)```
 
-If you'd like to use the `dev` branch to use beta features, use this one-liner instead:
+To deploy a different branch, export `NPK_BRANCH` first. The installer takes the branch from
+the environment, so there is no separate script per branch:
 
-```source <(curl https://npkproject.io/cloudshell_install_dev.sh)```
+```bash
+export NPK_BRANCH=feature/on-demand-instances
+source <(curl -sL https://raw.githubusercontent.com/0x48756773/npk/feature/on-demand-instances/cloudshell_install.sh)
+```
+
+Other overrides, all optional and all exported before sourcing: `NPK_REPO` (default
+`0x48756773/npk`), `NPK_DIR` (default `/aws/mde/npk`), and `NPK_SKIP_DEPLOY` to set up the
+environment without deploying.
 
 ![cloudshell_oneliner](https://user-images.githubusercontent.com/143415/160295789-7b4f21fa-4ac3-4900-b78a-7a974b9f48ac.png)
 
@@ -38,17 +46,27 @@ Take the guess-work out of your campaigns. See how far you'll get and how much i
 
 ![coverage](https://user-images.githubusercontent.com/143415/156901016-a63b2ea1-fcf0-4a48-99c5-a1c6ab2e3221.png)
 
-### 4. Max price enforcement and runaway instance protection
+### 4. Spot or On-Demand provisioning
+
+Pick how each campaign is provisioned right in the campaign builder. **Spot** is the cheapest way to crack and is the right default, but AWS can reclaim the instances at any time and end your campaign early. **On-Demand** costs more per hour and cannot be interrupted, which matters when a campaign has to finish on a schedule.
+
+Prices, quotas, and available instance sizes all update to match the model you select.
+
+**Note:** Spot and On-Demand draw on *separate* AWS service quotas. A healthy Spot quota tells you nothing about your On-Demand quota, which is zero by default on many accounts. Check the 'Quota' page in the NPK console before planning an On-Demand campaign, and request an increase to *Running On-Demand G and VT instances* (or *Running On-Demand P instances*) if you need one.
+
+### 5. Max price enforcement and runaway instance protection
 
 GPU instances are expensive. Runaway GPU instances are EXTREMELY expensive. NPK will enforce a maximum campaign price limit, and was designed to prevent runaway instances even with a complete failure of the management plane.
 
-### 5. Multi-Tenancy & SAML-based single sign-on
+On-Demand campaigns are launched as EC2 Fleets with an expiry attached, so AWS itself terminates the instances when the campaign's time or budget runs out &mdash; even if every Lambda in the account stops running.
+
+### 6. Multi-Tenancy & SAML-based single sign-on
 
 NPK supports multiple users, with strict separation of data, campaigns, and results between each user. It can optionally integrate with SAML-based federated identity providers to enable large teams to use NPK with minimal effort.
 
 ![user_administration](https://user-images.githubusercontent.com/143415/156901873-6c89bb50-5268-4382-aebd-e45ee5ff2f9f.png)
 
-### 6. Data lifecycle management
+### 7. Data lifecycle management
 
 Configure how long data will stay in NPK with configurable lifecycle durations during installation. Hashfiles and results are automatically removed after this much time to keep things nicely cleaned up.
 
@@ -62,7 +80,7 @@ Configure how long data will stay in NPK with configurable lifecycle durations d
 2. Click the AWS CloudShell button in the top right corner.
 ![cloudshell_icon](https://user-images.githubusercontent.com/143415/156901055-5107d4b2-c5b4-4ca5-8454-57e7504e2316.png)
 
-3. Paste in the one-liner: `source <(curl https://npkproject.io/cloudshell_install.sh)`
+3. Paste in the one-liner: `source <(curl -sL https://raw.githubusercontent.com/0x48756773/npk/main/cloudshell_install.sh)`
 4. Use the wizard to complete the configuration
 
 When the deploy finishes, you'll be dropped to a custom prompt, which indicates that NPK is deployed and CloudShell is connected to it.
@@ -79,7 +97,7 @@ See https://github.com/c6fc/npk/wiki/Detailed-NPK-Settings for more details abou
 
 To connect to an existing NPK installation (which is needed to modify or uninstall NPK), log into the AWS account where NPK resides, click the CloudShell icon, and paste in the one-liner:
 
-```source <(curl https://npkproject.io/cloudshell_install.sh)```
+```source <(curl -sL https://raw.githubusercontent.com/0x48756773/npk/main/cloudshell_install.sh)```
 
 CloudShell will now connect to NPK (which may take a minute or two), after which you'll drop to a new prompt that looks like this:
 
@@ -92,7 +110,7 @@ You're now connected to your NPK installation. This can be performed by any user
 You can change the settings of an install without losing your existing campaigns. Use the instructions above to connect to your NPK installation, then edit `npk-settings.json` as necessary and run `npm run update`. It's that easy!
 
 ```sh
-cloudshell-user$ source <(curl https://npkproject.io/cloudshell_install.sh)
+cloudshell-user$ source <(curl -sL https://raw.githubusercontent.com/0x48756773/npk/main/cloudshell_install.sh)
 @c6fc/npk> vim npk-settings.json
 < ... change your settings however you need >
 @c6fc/npk> npm run update
@@ -109,7 +127,7 @@ Once NPK has been deployed, administrative users can use the NPK console to uplo
 You can completely turn down NPK and delete all of its data from AWS very easily. Just attach your CloudShell to NPK, then run `npm run destroy`:
 
 ```sh
-cloudshell-user$ source <(curl https://npkproject.io/cloudshell_install.sh)
+cloudshell-user$ source <(curl -sL https://raw.githubusercontent.com/0x48756773/npk/main/cloudshell_install.sh)
 @c6fc/npk> npm run destroy
 ```
 

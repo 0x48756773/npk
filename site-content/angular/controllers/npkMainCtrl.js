@@ -29,6 +29,26 @@ angular
         return typeof what;
       };
 
+      // Campaign statuses are stored as bare tokens and were previously rendered raw. The
+      // capacity states in particular need explaining: a campaign can now sit queued without
+      // having launched anything, which looks like a stall unless the UI says otherwise.
+      // Defined on the parent scope so both the dashboard and campaign management inherit it.
+      $scope.statusLabel = function(status) {
+        switch (status) {
+          case "AWAITING_CAPACITY":
+            return "Waiting for capacity";
+
+          case "ACQUIRING_CAPACITY":
+            return "Reserving capacity";
+
+          case "INSUFFICIENT_CAPACITY":
+            return "No capacity available";
+
+          default:
+            return status;
+        }
+      };
+
       $scope.settings = { self: {}, admin: {} };
       $scope.getSettings = function() {
 
@@ -694,6 +714,36 @@ angular
 
     $scope.familySortOrder = 'effectiveness';
 
+    // 'spot' is cheaper but can be interrupted; 'on-demand' costs more and can't be.
+    $scope.provisioningModel = 'spot';
+
+    $scope.setProvisioningModel = function(model) {
+      if ($scope.provisioningModel == model) {
+        return false;
+      }
+
+      $scope.provisioningModel = model;
+
+      // Prices, quotas and the set of affordable instance sizes all differ between the
+      // two models, so the entire selection has to be rebuilt from scratch.
+      $scope.selectedFamily = false;
+      $scope.selectedRegion = false;
+      $scope.selectedInstance = false;
+      $scope.instanceCount = 0;
+      $scope.totalPrice = 0;
+      $scope.totalCoverage = 0;
+      $scope.pricesLoaded = false;
+
+      // buildSliders() bails without a selected instance, so reset the count slider here
+      // or its handle keeps pointing at a limit that no longer applies.
+      const countSlider = $("#instance_count").data("ionRangeSlider");
+      if (countSlider) {
+        countSlider.update({ from: 0, min: 0, max: 0, block: true });
+      }
+
+      $scope.getInstanceOptions();
+    };
+
     $scope.instanceOptions = [];
 
     $scope.families = FAMILIES;
@@ -738,9 +788,17 @@ angular
       $scope.settingOptions = true;
       $scope.instanceOptions = [];
 
+      // Capture the model this run was started for; a toggle mid-flight must not have
+      // its results overwritten by the previous model's in-flight lookups.
+      const model = $scope.provisioningModel;
+
       await Promise.all(Object.keys(FAMILIES).map(async (gpu) => {
 
-        pricingSvc.getFamilySpotPriceHistory(gpu).then((data) => {
+        return pricingSvc.getFamilyPricing(gpu, model).then((data) => {
+
+          if (model != $scope.provisioningModel) {
+            return false;
+          }
 
           if (data[gpu].length > 0) {
             const cheapest = data[gpu].reduce((cheapest, option) => {
@@ -764,14 +822,23 @@ angular
               effectiveness
             });
 
-            $scope.$digest();
-            $scope.pricesLoaded = true;
-
+            // On-Demand prices resolve from a local constant rather than the network, so
+            // this can land in a tighter tick than the spot path ever did.
+            if (!$scope.$$phase) {
+              $scope.$digest();
+            }
           }
         });
       }));
 
+      // Always clear the spinner, even when nothing came back. A zero On-Demand quota is
+      // common, and an empty list is a real answer; a permanent spinner isn't.
+      $scope.pricesLoaded = true;
       $scope.settingOptions = false;
+
+      if (!$scope.$$phase) {
+        $scope.$digest();
+      }
     };
 
     $scope.pricesLoaded = false;
@@ -1260,7 +1327,7 @@ angular
         if (!FAMILIES[gpu].instances?.[instanceType]) return limit;
 
         let cpus = FAMILIES[gpu].instances?.[instanceType][1];
-        let code = FAMILIES[gpu].quotaCode;
+        let code = FAMILIES[gpu].spotQuotaCode;
         limit = Object.keys(QUOTAS).reduce((acc, cur) => {
           if (!QUOTAS[cur]?.[code]) return acc;
 
@@ -1470,6 +1537,7 @@ angular
       $scope.order = {
         region: $scope.selectedRegion.region,
         instanceType: $scope.selectedInstance.instanceType,
+        provisioningModel: $scope.provisioningModel,
         hashFile: $scope.selectedHashes[0].Key.split('/').slice(1).join('/'),
         hashFileUrl: "...",
         hashType: $scope.hashType,
@@ -2623,6 +2691,22 @@ angular
     $scope.families = FAMILIES;
     $scope.familyregions = FAMILYREGIONS;
     $scope.all_regions = REGIONS;
+
+    // Spot and On-Demand are governed by separate limits, so the table shows one at a time.
+    $scope.quotaModel = 'spot';
+
+    $scope.setQuotaModel = function(model) {
+      $scope.quotaModel = model;
+    };
+
+    $scope.quotaCodeFor = function(gpu) {
+      return ($scope.quotaModel == 'on-demand') ?
+        FAMILIES[gpu].onDemandQuotaCode : FAMILIES[gpu].spotQuotaCode;
+    };
+
+    $scope.regionQuota = function(gpu, region) {
+      return QUOTAS?.[region]?.[$scope.quotaCodeFor(gpu)] ?? 0;
+    };
 
     $scope.onReady = function() {
       $scope.$parent.startApp();

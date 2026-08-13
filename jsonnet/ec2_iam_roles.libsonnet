@@ -71,7 +71,10 @@
 					"sid": "1",
 					"actions": [
 						"ec2:DescribeTags",
-						"ec2:DescribeSpotFleetInstances"
+						"ec2:DescribeSpotFleetInstances",
+
+						// On-Demand nodes enumerate their peers through EC2 Fleet instead.
+						"ec2:DescribeFleetInstances"
 					],
 					"resources": ["*"]
 				}, {

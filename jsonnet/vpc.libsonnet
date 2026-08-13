@@ -39,6 +39,11 @@
 					availability_zone: azs[i],
 					vpc_id: vpc_id,
 
+					// EC2 Fleet passes the subnet as a launch template override, which is
+					// mutually exclusive with declaring a network interface in the template.
+					// Auto-assigning here lets On-Demand nodes reach the internet without one.
+					map_public_ip_on_launch: true,
+
 					tags: {
 						Name: "%s-subnet-%s" % [name, azs[i]]
 					}

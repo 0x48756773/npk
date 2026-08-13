@@ -49,6 +49,7 @@ local settings = {
 	families: gpu_instance_families,
 	regions: validatedSettings.regions,
 	quotas: validatedSettings.quotas,
+	onDemandPrices: if std.objectHas(validatedSettings, 'onDemandPrices') then validatedSettings.onDemandPrices else {},
 	useCustomDNS: std.objectHas(validatedSettings, 'dnsBaseName'),
 	useSAML: std.objectHas(npksettings, 'sAMLMetadataFile') || std.objectHas(npksettings, 'sAMLMetadataUrl')
 } + if !std.objectHas(validatedSettings, 'dnsBaseName') then {} else {
@@ -566,7 +567,17 @@ local regionKeys = std.objectFields(settings.regions);
 				"ec2:CreateTags",
 				"ec2:DescribeImages",
 				"ec2:DescribeSpotPriceHistory",
-				"ec2:DescribeSpotFleetRequests"
+				"ec2:DescribeSpotFleetRequests",
+
+				// On-Demand campaigns are torn down as EC2 Fleets.
+				"ec2:DescribeFleets",
+				"ec2:DeleteFleets",
+				"ec2:TerminateInstances",
+				"ec2:DeleteLaunchTemplate",
+
+				// Cancelling a campaign has to stop the meter immediately: reserved capacity
+				// bills at the full On-Demand rate until it's released.
+				"ec2:CancelCapacityReservation"
 			],
 			resources: ["*"]
 		},{
@@ -620,7 +631,12 @@ local regionKeys = std.objectFields(settings.regions);
 		statement: [{
 			sid: "s3GetUserFile",
 			actions: [
-				"s3:GetObject"
+				"s3:GetObject",
+
+				// A campaign that waited for capacity outlives the presigned hash file URL
+				// the browser signed for it, so the manifest is rewritten with a fresh one
+				// immediately before launch.
+				"s3:PutObject"
 			],
 			resources: [
 				"${aws_s3_bucket.user_data.arn}/*"
@@ -634,7 +650,26 @@ local regionKeys = std.objectFields(settings.regions);
 				"ec2:DescribeSpotPriceHistory",
 				"ec2:RequestSpotFleet",
 				"ec2:RunInstances",
-				"ec2:CreateTags"
+				"ec2:CreateTags",
+
+				// On-Demand campaigns launch via EC2 Fleet, which requires a launch template.
+				"ec2:CreateFleet",
+				"ec2:CreateLaunchTemplate",
+				"ec2:DeleteLaunchTemplate",
+				"ec2:DescribeLaunchTemplates",
+
+				// On-Demand capacity is reserved before the fleet is created, so that the
+				// fleet fills completely and at once instead of trickling in.
+				"ec2:CreateCapacityReservation",
+				"ec2:CancelCapacityReservation",
+				"ec2:DescribeCapacityReservations"
+			],
+			resources: ["*"]
+		},{
+			sid: "pricing",
+			actions: [
+				// Used to resolve the published On-Demand rate at launch time.
+				"pricing:GetProducts"
 			],
 			resources: ["*"]
 		},{
@@ -743,6 +778,10 @@ local regionKeys = std.objectFields(settings.regions);
 				region: "${var.region}",
 				campaign_max_price: "${var.campaign_max_price}",
 				critical_events_sns_topic: "${aws_sns_topic.critical_events.id}",
+
+				// Campaigns parked waiting for On-Demand capacity are retried by re-invoking
+				// execute_campaign, which owns the launch path.
+				execute_campaign_function: "${aws_lambda_function.execute_campaign.function_name}",
 				regions: std.manifestJsonEx({
 					[region]: "${aws_vpc.npk-%s.id}" % region
 					for region in regionKeys
@@ -755,6 +794,14 @@ local regionKeys = std.objectFields(settings.regions);
 		}
 	}, {
 		statement: [{
+			sid: "invokeExecuteCampaign",
+			actions: [
+				"lambda:InvokeFunction"
+			],
+			resources: [
+				"${aws_lambda_function.execute_campaign.arn}"
+			]
+		},{
 			sid: "sns",
 			actions: [
 				"sns:Publish"
@@ -773,7 +820,20 @@ local regionKeys = std.objectFields(settings.regions);
 				"ec2:DescribeSpotFleetRequestHistory",
 				"ec2:DescribeSpotFleetInstances",
 				"ec2:DescribeSpotInstanceRequests",
-				"ec2:DescribeSpotPriceHistory"
+				"ec2:DescribeSpotPriceHistory",
+
+				// On-Demand campaigns are tracked and torn down as EC2 Fleets.
+				"ec2:DescribeFleets",
+				"ec2:DescribeFleetHistory",
+				"ec2:DescribeFleetInstances",
+				"ec2:DeleteFleets",
+				"ec2:TerminateInstances",
+				"ec2:DeleteLaunchTemplate",
+
+				// Reserved capacity keeps billing until it's cancelled, however empty it is,
+				// so it's released on every path that ends an On-Demand campaign.
+				"ec2:CancelCapacityReservation",
+				"ec2:DescribeCapacityReservations"
 			],
 			resources: ["*"]
 		},{
@@ -1142,6 +1202,7 @@ local regionKeys = std.objectFields(settings.regions);
 						familyRegions: std.strReplace(std.manifestJsonEx(settings.familyRegions, ""), "\n", ""),
 						families: std.strReplace(std.manifestJsonEx(settings.families, ""), "\n", ""),
 						quotas: std.strReplace(std.manifestJsonEx(settings.quotas, ""), "\n", ""),
+						onDemandPrices: std.strReplace(std.manifestJsonEx(settings.onDemandPrices, ""), "\n", ""),
 						regions: std.strReplace(std.manifestJsonEx(settings.regions, ""), "\n", ""),
 						api_gateway_url: if settings.useCustomDNS then
 								settings.apiEndpoint

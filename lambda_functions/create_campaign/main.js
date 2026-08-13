@@ -5,13 +5,30 @@ const aws = require('aws-sdk');
 const uuid = require('uuid/v4');
 
 const accountDetails = JSON.parse(fs.readFileSync('./accountDetails.json', 'ascii'));
+
+// The instances entry is [gpuCount, vcpuCount]; quotas are denominated in vCPUs.
 const vcpus = Object.keys(accountDetails.families).reduce((acc, curr) => {
 	Object.keys(accountDetails.families[curr].instances).forEach((instance) => {
-		acc[instance] = accountDetails.families[curr].instances[instance];
+		acc[instance] = accountDetails.families[curr].instances[instance][1];
 	});
 
 	return acc;
 }, {});
+
+// Spot and On-Demand draw from separate service quotas, so each instance type
+// maps to a different quota code depending on how the campaign is provisioned.
+const quotaCodes = Object.keys(accountDetails.families).reduce((acc, curr) => {
+	Object.keys(accountDetails.families[curr].instances).forEach((instance) => {
+		acc[instance] = {
+			spot: accountDetails.families[curr].spotQuotaCode,
+			"on-demand": accountDetails.families[curr].onDemandQuotaCode
+		};
+	});
+
+	return acc;
+}, {});
+
+const provisioningModels = ["spot", "on-demand"];
 
 const ddb = new aws.DynamoDB({ region: accountDetails.primaryRegion });
 const s3 = new aws.S3({ region: accountDetails.primaryRegion });
@@ -175,24 +192,25 @@ exports.main = async function(event, context, callback) {
 		return respond(400, {}, campaign.instanceType + " is not a valid or allowed instance type.", false);
 	}
 
-	let quota = 0;
-	switch (campaign.instanceType.split("")[0]) {
-		case 'g':
-			quota = variables.gQuota;
-		break;
+	// Default to spot so campaigns created before On-Demand support behave as they always have.
+	const provisioningModel = campaign.provisioningModel ?? "spot";
 
-		case 'p':
-			quota = variables.pQuota;
-		break;
-
-		default:
-			return respond(400, {}, "Unable to determine applicable quota for " + campaign.instanceType, false);
-		break;
+	if (provisioningModels.indexOf(provisioningModel) < 0) {
+		return respond(400, {}, `provisioningModel must be one of [${provisioningModels.join(', ')}], got '${provisioningModel}'`, false);
 	}
+
+	verifiedManifest.provisioningModel = provisioningModel;
+
+	const quotaCode = quotaCodes[campaign.instanceType]?.[provisioningModel];
+	if (!quotaCode) {
+		return respond(400, {}, `Unable to determine applicable ${provisioningModel} quota for ${campaign.instanceType}`, false);
+	}
+
+	const quota = accountDetails.quotas?.[campaign.region]?.[quotaCode] ?? 0;
 
 	const neededVCPUs = vcpus[campaign.instanceType] * parseInt(campaign.instanceCount);
 	if (quota < neededVCPUs) {
-		return respond(400, {}, "Order exceeds account quota limits. Needs " + neededVCPUs + " but account is limited to " + quota, false);
+		return respond(400, {}, `Order exceeds account ${provisioningModel} quota limits in ${campaign.region}. Needs ${neededVCPUs} vCPUs but account is limited to ${quota}`, false);
 	}
 
 	verifiedManifest.instanceType = campaign.instanceType;
@@ -445,6 +463,7 @@ exports.main = async function(event, context, callback) {
 	try {
 		const updateParams = aws.DynamoDB.Converter.marshall({
 			instanceType: verifiedManifest.instanceType,
+			provisioningModel: verifiedManifest.provisioningModel,
 			status: "AVAILABLE",
 			active: false,
 			durationSeconds: verifiedManifest.instanceDuration * 3600,

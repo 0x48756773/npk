@@ -19,7 +19,36 @@
              
             <!-- Start campaign form -->
             <form>
-              
+
+              <div class="row mb-3">
+                <div class="col-lg-12">
+                  <div class="card border border-white shadow-none">
+                    <div class="card-header bg-dark text-white">
+                      Provisioning Model
+                    </div>
+                    <div class="card-body bg-dark text-center p-2">
+                      <div class="btn-group" role="group">
+                        <button type="button" class="btn btn-sm waves-effect waves-light" ng-class="provisioningModel == 'spot' ? 'btn-success' : 'btn-outline-success'" ng-click="setProvisioningModel('spot')">
+                          Spot
+                        </button>
+                        <button type="button" class="btn btn-sm waves-effect waves-light" ng-class="provisioningModel == 'on-demand' ? 'btn-success' : 'btn-outline-success'" ng-click="setProvisioningModel('on-demand')">
+                          On-Demand
+                        </button>
+                      </div>
+                      <div class="text-white mt-2" style="font-size: 12px; opacity: 0.7;">
+                        <span ng-if="provisioningModel == 'spot'">
+                          Cheapest per hour, but AWS can reclaim these instances at any time and end your campaign early.
+                        </span>
+                        <span ng-if="provisioningModel == 'on-demand'">
+                          Costs more per hour and will not be interrupted. Draws on a separate account quota from Spot &mdash;
+                          <a href="#/quota" class="text-white"><u>check your limits</u></a> if nothing is listed below.
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
               <div class="row mb-3">
                 <div class="col-lg-3">
                   <div class="card border border-white shadow-none">
@@ -67,6 +96,15 @@
                     </div>
                     <div class="bg-dark text-center" ng-hide="pricesLoaded">
                       <img height="50px" width="50px" src="assets/images/loading.gif">
+                    </div>
+
+                    <!-- Nothing to show. Most often a zero On-Demand quota, which is the
+                         default on new accounts and is a separate limit from Spot. -->
+                    <div class="card-body bg-dark p-2 text-center text-warning" style="font-size: 12px;" ng-show="pricesLoaded && instanceOptions.length == 0">
+                      No GPU instances are available to you with your current
+                      <span ng-if="provisioningModel == 'on-demand'">On-Demand</span><span ng-if="provisioningModel == 'spot'">Spot</span>
+                      quota.<br />
+                      <a href="#/quota" class="text-warning"><u>Review your quotas</u></a>
                     </div>
 
                     <!-- best -->
@@ -153,7 +191,7 @@
                       <button ng-repeat="instance in selectedRegion.instances" class="btn btn-sm waves-effect waves-light m-1 border border-sm pl-5 pr-5 pt-2" ng-class="selectedInstance == instance ? 'btn-success' : 'btn-outline-success'" ng-click="selectInstance(instance)">
                         <font style="font-size: 16px;">{{ instance.instanceType }}</font><br />
                         {{ pricingSvc.gpuSpeeds[selectedFamily.gpu][hashType] * families[selectedFamily.gpu].instances[instance.instanceType][0] | toHs }}<br />
-                        ${{ instance.price | number:2 }} /Hr<br />
+                        ${{ instance.price | number:2 }} /Hr {{ provisioningModel == 'on-demand' ? 'On-Demand' : 'Spot' }}<br />
                         Limit: {{ instance.limit }}<br />
                       </button>
                     </div>
@@ -649,6 +687,20 @@
                               {{ totalPrice.toFixed(2).toString().split('.')[1] }}
                             </u>
                           </span>
+
+                          <!-- Spell out how the estimate is built, and how much to trust it. -->
+                          <div class="text-white" style="font-size: 12px; opacity: 0.7;" ng-show="selectedInstance">
+                            {{ instanceCount }} &times; {{ selectedInstance.instanceType }}
+                            @ ${{ selectedInstance.price | number:3 }}/hr
+                            &times; {{ instanceDuration }} hour{{ instanceDuration == 1 ? '' : 's' }}
+                            <div class="mt-1" ng-if="provisioningModel == 'on-demand'">
+                              Fixed On-Demand rate.
+                            </div>
+                            <div class="mt-1" ng-if="provisioningModel == 'spot'">
+                              Spot rates move; final cost will vary.
+                            </div>
+                          </div>
+
                           <br />
                           <button class="btn btn-lg waves-effect waves-light m-1" ng-click="verifyOrder()" ng-class="totalCoverage < 125 || totalCoverage > 2400 ? 'btn-dark' : 'btn-success'">
                             <i class="fa fa-crosshairs"></i>
@@ -745,6 +797,10 @@
                 {{ totalPrice.toFixed(2).toString().split('.')[1] }}
               </u>
             </span>
+            <div style="font-size: 12px;">
+              {{ order.instanceType }} &middot;
+              {{ provisioningModel == 'on-demand' ? 'On-Demand (fixed rate)' : 'Spot (rate varies)' }}
+            </div>
           </div>
         </div>
       </div>

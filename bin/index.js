@@ -114,6 +114,24 @@ async function deploy(skipInit, autoApprove) {
 		}
 	}
 
+	// On-Demand campaigns launch through EC2 Fleet, which has its own service linked role.
+	try {
+		await iam.getRole({
+			RoleName: "AWSServiceRoleForEC2Fleet"
+		}).promise();
+	} catch (e) {
+		console.log(`[*] EC2 fleet SLR is not present. Creating...`);
+
+		try {
+			await iam.createServiceLinkedRole({
+				AWSServiceName: "ec2fleet.amazonaws.com"
+			}).promise();
+		} catch (e) {
+			console.trace(e);
+			console.log(`[!] Unable to create service linked role: ${e}`);
+		}
+	}
+
 	console.log("\n[*] All prerequisites finished. Generating infrastructure configurations.");
 
 	Object.assign(validatedSettings, computedQuotas);
@@ -172,12 +190,13 @@ async function getAZsWithQuota() {
 	// Check quotas for all regions.
 	const families = JSON.parse(fs.readFileSync('./jsonnet/gpu_instance_families.json'));
 
+	// Spot and On-Demand are governed by separate quotas, so collect both.
 	const quotaCodes = Object.keys(families).reduce((codes, family) => {
-		const code = families[family].quotaCode;
-
-		if (codes.indexOf(code) == -1) {
-			codes.push(code);
-		}
+		[families[family].spotQuotaCode, families[family].onDemandQuotaCode].forEach((code) => {
+			if (!!code && codes.indexOf(code) == -1) {
+				codes.push(code);
+			}
+		});
 
 		return codes;
 	}, []);
@@ -201,8 +220,9 @@ async function getAZsWithQuota() {
 					maxQuota = (q.Value > maxQuota) ? q.Value : maxQuota;
 				}
 			}).catch(e => {
-				console.log(`[-] Unable to get quotas for ${region}, but this isn't fatal.`);
-				regions = regions.filter(r => r != region);
+				// A single quota code failing doesn't disqualify the region; regions with no
+				// usable quota at all are dropped below when 'regionQuotas' is keyed off.
+				console.log(`[-] Unable to get quota ${qc} for ${region}, but this isn't fatal.`);
 			}));
 		});
 
@@ -212,7 +232,7 @@ async function getAZsWithQuota() {
 	await Promise.all(quotaPromises);
 
 	if (maxQuota == 0) {
-		console.log("[!] You are permitted zero GPU spot instances across all types and regions.");
+		console.log("[!] You are permitted zero GPU instances (Spot or On-Demand) across all types and regions.");
 		console.log("You cannot proceed without increasing your limits.");
 		console.log("-> A limit of at least 4 is required for minimal capacity.");
 		console.log("-> A limit of 40 is required to use the largest instances.");
@@ -269,6 +289,10 @@ async function getAZsWithQuota() {
 
 	console.log("[+] Retrieved per-region instance support.");
 
+	result.onDemandPrices = await getOnDemandPrices(instanceAvailabilityInRegions);
+
+	console.log("[+] Retrieved On-Demand prices.");
+
 	// Retrieve availability zones for regions with appropriate quotas.
 	const azs = {};
 	const azPromises = Object.keys(regionQuotas).reduce((promises, region) => {
@@ -296,6 +320,85 @@ async function getAZsWithQuota() {
 	console.log("[+] Retrieved availability zones.");
 
 	return result;	
+}
+
+// On-Demand rates are published, flat, and change rarely, so they're resolved once at deploy
+// time and baked into the site config alongside QUOTAS and FAMILIES. The rate that actually
+// governs spend is re-resolved server-side by execute_campaign when a campaign starts; this
+// is only the estimate shown in the campaign builder.
+async function getOnDemandPrices(familyRegions) {
+
+	const aws = sonnetry.aws;
+
+	// The Pricing API is only served from a few regions regardless of what's being priced.
+	const pricing = new aws.Pricing({ region: "us-east-1" });
+
+	// Only ask about instance types that are actually offered in a given region.
+	const pairs = Object.keys(familyRegions).reduce((acc, gpu) => {
+		Object.keys(familyRegions[gpu]).forEach((region) => {
+			Object.keys(familyRegions[gpu][region]).forEach((instanceType) => {
+				acc.push([region, instanceType]);
+			});
+		});
+
+		return acc;
+	}, []);
+
+	const prices = {};
+
+	// Chunked rather than fully parallel; the Pricing API throttles aggressively.
+	const concurrency = 10;
+
+	for (let i = 0; i < pairs.length; i += concurrency) {
+		await Promise.all(pairs.slice(i, i + concurrency).map(async ([region, instanceType]) => {
+			try {
+				const products = await pricing.getProducts({
+					ServiceCode: "AmazonEC2",
+					Filters: [
+						{ Type: "TERM_MATCH", Field: "instanceType", Value: instanceType },
+						{ Type: "TERM_MATCH", Field: "regionCode", Value: region },
+						{ Type: "TERM_MATCH", Field: "operatingSystem", Value: "Linux" },
+						{ Type: "TERM_MATCH", Field: "tenancy", Value: "Shared" },
+						{ Type: "TERM_MATCH", Field: "preInstalledSw", Value: "NA" },
+						{ Type: "TERM_MATCH", Field: "capacitystatus", Value: "Used" }
+					],
+					MaxResults: 10
+				}).promise();
+
+				const price = parseOnDemandPrice(products.PriceList ?? []);
+
+				if (price !== null) {
+					prices[region] ??= {};
+					prices[region][instanceType] = price;
+				}
+			} catch (e) {
+				console.log(`[-] Unable to price ${instanceType} in ${region}, but this isn't fatal.`);
+			}
+		}));
+	}
+
+	return prices;
+}
+
+// PriceList entries are JSON-encoded strings shaped as:
+//   terms.OnDemand.<offerCode>.priceDimensions.<rateCode>.pricePerUnit.USD
+function parseOnDemandPrice(priceList) {
+	return priceList
+		.map(entry => (typeof entry == "string") ? JSON.parse(entry) : entry)
+		.reduce((cheapest, product) => {
+			Object.values(product?.terms?.OnDemand ?? {}).forEach((offer) => {
+				Object.values(offer?.priceDimensions ?? {}).forEach((dimension) => {
+					const usd = parseFloat(dimension?.pricePerUnit?.USD);
+
+					// Free-tier and $0 dimensions aren't the rate we're looking for.
+					if (!!usd && (cheapest === null || usd < cheapest)) {
+						cheapest = usd;
+					}
+				});
+			});
+
+			return cheapest;
+		}, null);
 }
 
 async function configureInteractive() {
