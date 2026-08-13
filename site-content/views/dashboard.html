@@ -266,7 +266,7 @@
                       <td><small>${{ campaign.price | number:2 }}</small></td>
                       <td>
                         <small ng-if="!!!campaign.interrupted">
-                          {{ campaign.status }}
+                          {{ $parent.statusLabel(campaign.status) }}
                         </small>
                         <div ng-if="!!campaign.interrupted" class="badge bg-warning">
                           {{ campaign.interrupted == 'Spot Interruption' ? 'Interrupted: Outbid' : 'Interrupted' }}

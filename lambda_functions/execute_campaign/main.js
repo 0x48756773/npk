@@ -31,6 +31,21 @@ const owners = Object.keys(accountDetails.families).reduce((acc, curr) => {
 const ddb = new aws.DynamoDB({ region: accountDetails.primaryRegion });
 const s3 = new aws.S3({ region: accountDetails.primaryRegion });
 
+// How long a campaign may sit waiting for On-Demand capacity before it gives up. Waiting is
+// free - a refused reservation costs nothing - so this is generous, and exists mainly so a
+// campaign nobody is watching can't stay queued indefinitely.
+const CAPACITY_WAIT_MAX_MS = 6 * 60 * 60 * 1000;
+
+// Every parked campaign carries this in place of a fleet ID, so spot_monitor can find them
+// all with one query against the existing 'SpotFleetRequests' index rather than scanning the
+// table. It is replaced by the real fleet ID the moment the campaign launches.
+const AWAITING_CAPACITY_KEY = "awaiting-capacity";
+
+// How long one retry may hold a campaign before another is allowed to take it over. Longer
+// than this function's own 60 second timeout, so a still-running retry is never displaced,
+// and short enough that an invocation killed mid-flight doesn't strand the campaign.
+const CAPACITY_CLAIM_LEASE_MS = 5 * 60 * 1000;
+
 let cb = "";
 let origin = "";
 let variables = {};
@@ -80,7 +95,27 @@ exports.main = async function(event, context, callback) {
 		return callback(`[!] Failed to retrieve subnets for VPC: ${e}`);
 	}
 
-	let entity, UserPoolId, sub;
+	// spot_monitor re-invokes this function for campaigns parked waiting on capacity. That
+	// path carries no API Gateway request context and no user credentials: the campaign was
+	// authorised when the user started it, and nothing about it can be changed from here, so
+	// identity comes from the event itself rather than from Cognito.
+	const retryingCapacity = event?.internal?.reason == "capacity-retry";
+
+	let entity, UserPoolId, sub, campaignId;
+
+	if (retryingCapacity) {
+
+		entity = event.internal.userid;
+		campaignId = event.internal.campaignId;
+
+		if (!entity || !campaignId) {
+			console.log("Internal invocation is missing userid or campaignId.", JSON.stringify(event));
+			return respond(400, {}, "Internal invocation is missing userid or campaignId.", false);
+		}
+
+		console.log(`[*] Retrying capacity acquisition for campaign ${campaignId}.`);
+
+	} else {
 
 	try {
 
@@ -150,7 +185,9 @@ exports.main = async function(event, context, callback) {
 
 	console.log(event.pathParameters)
 
-	const campaignId = event?.pathParameters?.campaign;
+	campaignId = event?.pathParameters?.campaign;
+
+	}
 
 	// Get the campaign entry from DynamoDB, and manifest from S3.
 	// * In parallel, to save, like, some milliseconds.
@@ -180,34 +217,101 @@ exports.main = async function(event, context, callback) {
 		return respond(500, {}, "Failed to retrieve campaign details.", false);
 	}
 
-	if (campaign.Items?.[0]?.status?.S != "AVAILABLE") {
+	// A user-initiated start needs a fresh campaign. A capacity retry is checked separately,
+	// by claiming it, because merely reading the status isn't enough there.
+	if (!retryingCapacity && campaign.Items?.[0]?.status?.S != "AVAILABLE") {
 		return respond(404, {}, "Campaign doesn't exist or is not in 'AVAILABLE' status.", false);
 	}
 
-	// Test whether the provided presigned URL is expired.
+	if (retryingCapacity) {
 
+		// Only one retry may hold a campaign at a time. The monitor fires every minute and
+		// this function is allowed to run for a full minute, so two invocations can overlap -
+		// and if both got as far as reserving capacity, the campaign would be paying for two
+		// sets of instances it can only ever use one of.
+		//
+		// The claim doubles as the status check: it only succeeds from AWAITING_CAPACITY, so a
+		// campaign the user cancelled while it waited is refused here. It's a lease rather
+		// than a flag so that an invocation which dies mid-flight releases the campaign
+		// instead of stranding it.
+		const claimedAt = new Date().getTime();
+
+		try {
+			await ddb.updateItem({
+				Key: {
+					userid: {S: entity},
+					keyid: {S: `campaigns:${campaignId}`}
+				},
+				TableName: "Campaigns",
+				UpdateExpression: "SET #status = :acquiring, capacityClaimedAt = :now",
+				ConditionExpression: "#status = :awaiting OR (#status = :acquiring AND capacityClaimedAt < :stale)",
+				ExpressionAttributeNames: {
+					"#status": "status"
+				},
+				ExpressionAttributeValues: {
+					":acquiring": {S: "ACQUIRING_CAPACITY"},
+					":awaiting": {S: "AWAITING_CAPACITY"},
+					":now": {N: claimedAt.toString()},
+					":stale": {N: (claimedAt - CAPACITY_CLAIM_LEASE_MS).toString()}
+				}
+			}).promise();
+		} catch (e) {
+			if (e.code == "ConditionalCheckFailedException") {
+				console.log(`[-] Campaign ${campaignId} is already being retried, or is no longer waiting.`);
+				return respond(200, {}, "Campaign is already being retried, or is no longer waiting.", false);
+			}
+
+			console.log("Failed to claim campaign for a capacity retry.", e);
+			return respond(500, {}, "Failed to claim campaign for a capacity retry.", false);
+		}
+	}
+
+	// Giving up has to happen somewhere that runs on every retry, and this is it. The monitor
+	// only pokes this function; it doesn't decide when a campaign has waited long enough.
+	if (retryingCapacity) {
+		const waitUntil = parseInt(campaign.Items[0].capacityWaitUntil?.N ?? "0");
+
+		if (!!waitUntil && new Date().getTime() > waitUntil) {
+			console.log(`[!] Campaign ${campaignId} waited past ${new Date(waitUntil).toISOString()} without capacity; giving up.`);
+
+			await markCampaign(entity, campaignId, {
+				active: false,
+				status: "INSUFFICIENT_CAPACITY",
+				spotFleetRequestId: `expired:${campaignId}`
+			});
+
+			return respond(200, {}, "Campaign gave up waiting for capacity.", false);
+		}
+	}
+
+	// Test whether the provided presigned URL is expired. A parked campaign is expected to
+	// outlive the URL the user submitted with it - they're signed in the browser for an hour -
+	// so this only guards the immediate path, where that URL is the one the nodes will use.
+	// The retry path re-signs from the object itself just before launching.
 	let expires, duration;
 
-	try {
-		expires = /[^-]Expires=([\d]+)&/.exec(manifest.hashFileUrl)?.[1];
+	if (!retryingCapacity) {
+		try {
+			expires = /[^-]Expires=([\d]+)&/.exec(manifest.hashFileUrl)?.[1];
 
-		if (!!!expires) {
-			let date = /X-Amz-Date=([^&]+)&/.exec(manifest.hashFileUrl)?.[1];
-			let seconds = /X-Amz-Expires=([\d]+)&/.exec(manifest.hashFileUrl)?.[1];
+			if (!!!expires) {
+				let date = /X-Amz-Date=([^&]+)&/.exec(manifest.hashFileUrl)?.[1];
+				let seconds = /X-Amz-Expires=([\d]+)&/.exec(manifest.hashFileUrl)?.[1];
 
-			date = new Date(Date.parse(date.replace(/(....)(..)(..T..)(..)/, "$1-$2-$3:$4:"))).getTime();
+				date = new Date(Date.parse(date.replace(/(....)(..)(..T..)(..)/, "$1-$2-$3:$4:"))).getTime();
 
-			expires = date + (seconds * 1000)
+				expires = date + (seconds * 1000)
+			}
+
+			duration = expires - (new Date().getTime() / 1000);
+
+			if (duration < 900) {
+				return respond(400, {}, `hashFileUrl must be valid for at least 900 seconds, got ${Math.floor(duration)}`, false);
+			}
+		} catch (e) {
+			console.log(e);
+			return respond(400, {}, "Invalid hashFileUrl; missing expiration", false);
 		}
-
-		duration = expires - (new Date().getTime() / 1000);
-
-		if (duration < 900) {
-			return respond(400, {}, `hashFileUrl must be valid for at least 900 seconds, got ${Math.floor(duration)}`, false);
-		}
-	} catch (e) {
-		console.log(e);
-		return respond(400, {}, "Invalid hashFileUrl; missing expiration", false);
 	}
 
 	// Campaign is valid. Get AZ pricing and Image AMI
@@ -299,7 +403,11 @@ exports.main = async function(event, context, callback) {
 
 	const instance_userdata = new Buffer.from(fs.readFileSync(__dirname + '/userdata.sh', 'utf-8')
 		.replace("{{APIGATEWAY}}", process.env.apigateway)
-		.replace("{{MANIFESTPATH}}", `${entity}/campaigns/${campaignId}`))
+		.replace("{{MANIFESTPATH}}", `${entity}/campaigns/${campaignId}`)
+		// Nodes divide the keyspace by their position in the fleet, which is only safe once
+		// the fleet is complete. Baking in the count they're waiting for is what lets a node
+		// tell a fleet that is still filling from one that is never going to fill.
+		.replace("{{INSTANCECOUNT}}", parseInt(manifest.instanceCount)))
 		.toString('base64');
 
 	// The lower of the user's target and the deployment-wide ceiling. This is the number the
@@ -425,9 +533,93 @@ exports.main = async function(event, context, callback) {
 
 	// 'requestId' is the fleet handle NPK tracks the campaign by, regardless of model.
 	// For On-Demand campaigns it's an EC2 Fleet ID; for spot it's a Spot Fleet Request ID.
-	let requestId, launchTemplateId;
+	let requestId, launchTemplateId, capacityReservationId;
 
 	if (provisioningModel == "on-demand") {
+
+		// Bound the fleet's lifetime by whichever runs out first: the requested duration, or
+		// the point at which the whole fleet would burn through the campaign's cost ceiling.
+		const instanceCount = parseInt(manifest.instanceCount);
+		const costLimitedDuration = maxCost / (hourlyRate * instanceCount);
+		const maxDuration = Math.min(Number(manifest.instanceDuration), costLimitedDuration);
+
+		console.log(`Setting Duration to ${maxDuration} (On-Demand $${hourlyRate}/hr x ${instanceCount} with limit of $${maxCost})`);
+
+		// These two checks used to run after the launch template was created, and each needed
+		// its own cleanup path. Neither depends on AWS state, so they now run before anything
+		// exists that could leak.
+		//
+		// A fleet whose budget buys less than a minute of runtime can't accomplish anything,
+		// and EC2 rejects a ValidUntil that's already passed. Fail with something readable.
+		if (maxDuration < (1 / 60)) {
+			console.log(`Campaign budget of $${maxCost} buys ${maxDuration} hours at $${hourlyRate}/hr x ${instanceCount}.`);
+			return respond(400, {}, `Campaign price limit of $${maxCost} is too low to run ${instanceCount} x ${manifest.instanceType} On-Demand at $${hourlyRate}/hr.`, false);
+		}
+
+		const subnets = variables.availabilityZones?.[manifest.region] ?? {};
+
+		// A manifest can name a region that's since been dropped from the deployment.
+		if (!Object.keys(subnets).length) {
+			console.log(`No subnets are known for region ${manifest.region}.`);
+			return respond(400, {}, `No usable subnets in ${manifest.region}. The region may no longer be part of this deployment.`, false);
+		}
+
+		// Reserve the capacity before committing to anything else. A reservation is per-AZ and
+		// all-or-nothing: AWS either holds the full instance count in that zone or refuses it,
+		// so trying each zone in turn is a probe that costs nothing when it fails. Holding the
+		// capacity up front is what makes the fleet fill completely and at once. Without it the
+		// fleet trickles in over tens of minutes, and nodes that boot at different times divide
+		// the keyspace against different fleet sizes - which is silent, and wastes the whole run.
+		let reservation;
+
+		try {
+			reservation = await acquireCapacityReservation(ec2, {
+				campaignId,
+				instanceType: manifest.instanceType,
+				instanceCount,
+				zones: Object.keys(subnets),
+				hours: maxDuration
+			});
+		} catch (e) {
+			// A quota refusal lands here and will land here again on every retry until the
+			// campaign's deadline passes. That's deliberate: it costs nothing, and guessing
+			// which failures are permanent would mean cancelling campaigns that might have
+			// launched. Hand it back so the next pass can try rather than waiting out the lease.
+			if (retryingCapacity) {
+				await releaseCapacityClaim(entity, campaignId);
+			}
+
+			console.log("Failed to reserve capacity.", e);
+			return respond(500, {}, `Failed to reserve capacity: ${e.message ?? e}`, false);
+		}
+
+		// Nothing available in the region right now. Park the campaign rather than launching a
+		// partial fleet; the monitor brings us back here every minute until capacity appears or
+		// the campaign's wait deadline passes.
+		if (!reservation) {
+			return await parkCampaignForCapacity(entity, campaignId, campaign.Items[0], {
+				instanceCount,
+				instanceType: manifest.instanceType,
+				region: manifest.region,
+				provisioningModel
+			});
+		}
+
+		// A campaign that waited has outlived the presigned URL the user submitted with it, so
+		// the manifest the nodes read is rewritten with a fresh one before any of them boot.
+		if (retryingCapacity) {
+			try {
+				await refreshHashFileUrl(entity, campaignId, manifest);
+			} catch (e) {
+				await Promise.all([
+					cancelCapacityReservationQuietly(ec2, reservation.reservationId),
+					releaseCapacityClaim(entity, campaignId)
+				]);
+
+				console.log("Failed to refresh the hash file URL.", e);
+				return respond(500, {}, "Failed to refresh the hash file URL.", false);
+			}
+		}
 
 		// EC2 Fleet launches exclusively from launch templates, so each campaign gets its own.
 		// It's torn down alongside the fleet by the monitor or by delete_campaign.
@@ -440,6 +632,15 @@ exports.main = async function(event, context, callback) {
 					ImageId: image.ImageId,
 					KeyName: "npk-key",
 					InstanceType: manifest.instanceType,
+
+					// Launch into the reservation rather than alongside it. Targeting it
+					// explicitly is what makes these instances consume the capacity we're
+					// already paying to hold, instead of racing the open market for more.
+					CapacityReservationSpecification: {
+						CapacityReservationTarget: {
+							CapacityReservationId: reservation.reservationId
+						}
+					},
 					BlockDeviceMappings: [{
 						DeviceName: '/dev/xvdb',
 						Ebs: {
@@ -483,37 +684,13 @@ exports.main = async function(event, context, callback) {
 
 			console.log(`[+] Created launch template ${launchTemplateId} for campaign ${campaignId}`);
 		} catch (e) {
+			await Promise.all([
+				cancelCapacityReservationQuietly(ec2, reservation.reservationId),
+				retryingCapacity ? releaseCapacityClaim(entity, campaignId) : Promise.resolve()
+			]);
+
 			console.log("Failed to create launch template.", e);
 			return respond(500, {}, "Failed to create launch template.", false);
-		}
-
-		// Bound the fleet's lifetime by whichever runs out first: the requested duration, or
-		// the point at which the whole fleet would burn through the campaign's cost ceiling.
-		const instanceCount = parseInt(manifest.instanceCount);
-		const costLimitedDuration = maxCost / (hourlyRate * instanceCount);
-		const maxDuration = Math.min(Number(manifest.instanceDuration), costLimitedDuration);
-
-		console.log(`Setting Duration to ${maxDuration} (On-Demand $${hourlyRate}/hr x ${instanceCount} with limit of $${maxCost})`);
-
-		// A fleet whose budget buys less than a minute of runtime can't accomplish anything,
-		// and EC2 rejects a ValidUntil that's already passed. Fail with something readable.
-		if (maxDuration < (1 / 60)) {
-			await deleteLaunchTemplateQuietly(ec2, launchTemplateId);
-
-			console.log(`Campaign budget of $${maxCost} buys ${maxDuration} hours at $${hourlyRate}/hr x ${instanceCount}.`);
-			return respond(400, {}, `Campaign price limit of $${maxCost} is too low to run ${instanceCount} x ${manifest.instanceType} On-Demand at $${hourlyRate}/hr.`, false);
-		}
-
-		const subnets = variables.availabilityZones?.[manifest.region] ?? {};
-
-		// A manifest can name a region that's since been dropped from the deployment. Catch
-		// it here rather than throwing out of the handler, which would strand the launch
-		// template created moments ago with no response ever sent to the caller.
-		if (!Object.keys(subnets).length) {
-			await deleteLaunchTemplateQuietly(ec2, launchTemplateId);
-
-			console.log(`No subnets are known for region ${manifest.region}.`);
-			return respond(400, {}, `No usable subnets in ${manifest.region}. The region may no longer be part of this deployment.`, false);
 		}
 
 		const fleetParams = {
@@ -523,10 +700,12 @@ exports.main = async function(event, context, callback) {
 					Version: "$Latest"
 				},
 
-				// One override per AZ lets the fleet fall back when a subnet is out of capacity.
-				Overrides: Object.keys(subnets).map((az) => ({
-					SubnetId: subnets[az]
-				}))
+				// A reservation lives in exactly one AZ, so there is nowhere else for these
+				// instances to go. Offering the fleet other subnets would only let it launch
+				// outside the capacity we're paying to hold.
+				Overrides: [{
+					SubnetId: subnets[reservation.availabilityZone]
+				}]
 			}],
 			TargetCapacitySpecification: {
 				TotalTargetCapacity: instanceCount,
@@ -571,15 +750,21 @@ exports.main = async function(event, context, callback) {
 		} catch (e) {
 			console.log("Failed to create EC2 fleet.", e);
 
-			// Don't strand the template if the fleet never came up.
-			await deleteLaunchTemplateQuietly(ec2, launchTemplateId);
+			// Don't strand the template, and above all don't strand the reservation - it bills
+			// at the full On-Demand rate whether or not anything is running in it.
+			await Promise.all([
+				deleteLaunchTemplateQuietly(ec2, launchTemplateId),
+				cancelCapacityReservationQuietly(ec2, reservation.reservationId),
+				retryingCapacity ? releaseCapacityClaim(entity, campaignId) : Promise.resolve()
+			]);
 
 			return respond(500, {}, "Failed to create EC2 fleet.", false);
 		}
 
 		requestId = fleet.FleetId;
+		capacityReservationId = reservation.reservationId;
 
-		console.log(`Successfully requested EC2 fleet ${requestId}`);
+		console.log(`Successfully requested EC2 fleet ${requestId} against reservation ${capacityReservationId}`);
 
 	} else {
 
@@ -609,10 +794,19 @@ exports.main = async function(event, context, callback) {
 			spotFleetRequestId: requestId,
 			provisioningModel,
 			launchTemplateId: launchTemplateId ?? "<none>",
+
+			// Recorded so delete_campaign can release it directly. The reservation also
+			// carries a CampaignId tag, which is how the monitor finds it when this write
+			// is the thing that failed.
+			capacityReservationId: capacityReservationId ?? "<none>",
 			hourlyRate: hourlyRate.toString(),
 			startTime: Math.floor(new Date().getTime() / 1000),
 			eventType: "CampaignStarted",
 			lastuntil: 0,
+
+			// Cleared so a campaign that waited doesn't keep a stale deadline if it is ever
+			// restarted, and so the monitor's pending query stops returning it.
+			capacityWaitUntil: 0
 		});
 
 		const updateCampaign = await ddb.updateItem({
@@ -644,6 +838,227 @@ exports.main = async function(event, context, callback) {
 function deleteLaunchTemplateQuietly(ec2, launchTemplateId) {
 	return ec2.deleteLaunchTemplate({ LaunchTemplateId: launchTemplateId }).promise()
 		.catch((e) => console.log(`[-] Also failed to clean up launch template ${launchTemplateId}.`, e));
+}
+
+// Same contract, but this one matters more: a capacity reservation bills at the full
+// On-Demand rate from the moment it exists, occupied or not. An orphaned reservation is a
+// silent, open-ended charge, so every abort path after one is created has to release it.
+function cancelCapacityReservationQuietly(ec2, capacityReservationId) {
+	return ec2.cancelCapacityReservation({ CapacityReservationId: capacityReservationId }).promise()
+		.catch((e) => console.log(`[-] Also failed to release capacity reservation ${capacityReservationId}.`, e));
+}
+
+// Capacity reservations are per-AZ and all-or-nothing: AWS either has the full instance count
+// in that zone and holds it for us, or the call fails and nothing is charged. Walking the
+// zones is therefore a free probe for "is there room for this campaign right now", and the
+// answer, when it's yes, comes with the capacity already secured.
+async function acquireCapacityReservation(ec2, params) {
+
+	const { campaignId, instanceType, instanceCount, zones, hours } = params;
+
+	// A retry that died between reserving capacity and recording it would otherwise reserve
+	// again on its next attempt, stacking up reservations that all bill in parallel and that
+	// nothing knows to release. Adopting whatever is already held for this campaign makes the
+	// whole operation idempotent, which is what allows it to be retried at all.
+	try {
+		const existing = await ec2.describeCapacityReservations({
+			Filters: [{
+				Name: "tag:CampaignId",
+				Values: [campaignId]
+			}, {
+				Name: "state",
+				Values: ["active"]
+			}]
+		}).promise();
+
+		const usable = (existing.CapacityReservations ?? []).find((reservation) =>
+			reservation.InstanceType == instanceType &&
+			reservation.TotalInstanceCount >= instanceCount
+		);
+
+		if (!!usable) {
+			console.log(`[+] Reusing existing capacity reservation ${usable.CapacityReservationId} in ${usable.AvailabilityZone}.`);
+
+			return {
+				reservationId: usable.CapacityReservationId,
+				availabilityZone: usable.AvailabilityZone
+			};
+		}
+	} catch (e) {
+		// Not being able to check is not a reason to refuse to launch; the worst case is the
+		// leak this check exists to avoid, which EndDate already bounds.
+		console.log(`[-] Unable to check for an existing capacity reservation for ${campaignId}.`, e);
+	}
+
+	// AWS requires an end date at least an hour out. Beyond the campaign's own runtime this
+	// only bounds how long an orphaned reservation could bill for, so it's kept close: the
+	// fleet's own ValidUntil is what actually ends the campaign.
+	const endDate = new Date(new Date().getTime() + (Math.max(hours, 1) * 3600 * 1000) + (15 * 60 * 1000));
+
+	for (const az of zones) {
+		try {
+			const result = await ec2.createCapacityReservation({
+				InstanceType: instanceType,
+				InstancePlatform: "Linux/UNIX",
+				AvailabilityZone: az,
+				InstanceCount: instanceCount,
+				Tenancy: "default",
+
+				// Without this, any matching instance in the account drifts into the
+				// reservation and eats capacity this campaign is paying to hold.
+				InstanceMatchCriteria: "targeted",
+				EndDate: endDate,
+				EndDateType: "limited",
+
+				TagSpecifications: [{
+					ResourceType: "capacity-reservation",
+					Tags: [{
+						Key: "CampaignId",
+						Value: campaignId
+					}, {
+						Key: "Name",
+						Value: `npk-${campaignId}`
+					}]
+				}]
+			}).promise();
+
+			const reservationId = result.CapacityReservation?.CapacityReservationId;
+
+			if (!reservationId) {
+				console.log(`[-] createCapacityReservation in ${az} returned no reservation ID.`, JSON.stringify(result));
+				continue;
+			}
+
+			console.log(`[+] Reserved ${instanceCount} x ${instanceType} in ${az} as ${reservationId}.`);
+
+			return { reservationId, availabilityZone: az };
+
+		} catch (e) {
+			// No room in this zone is the expected answer while waiting, not a failure.
+			if (e.code == "InsufficientInstanceCapacity" || e.code == "InsufficientCapacity") {
+				console.log(`[-] No capacity for ${instanceCount} x ${instanceType} in ${az}.`);
+				continue;
+			}
+
+			// Anything else - a quota refusal above all - would repeat in every zone and
+			// forever after, so it surfaces to the user instead of looking like patience.
+			throw e;
+		}
+	}
+
+	return null;
+}
+
+// Park a campaign that has nowhere to launch. The deadline is set once, on the first park, so
+// that retrying doesn't quietly extend how long a campaign can sit costing nothing but also
+// achieving nothing.
+async function parkCampaignForCapacity(entity, campaignId, campaignRow, details) {
+
+	const existingDeadline = parseInt(campaignRow?.capacityWaitUntil?.N ?? "0");
+	const waitUntil = !!existingDeadline ? existingDeadline : new Date().getTime() + CAPACITY_WAIT_MAX_MS;
+
+	// All parked campaigns share one GSI key so the monitor can find them with a single
+	// query instead of scanning the table. It's replaced by the real fleet ID at launch.
+	//
+	// Conditional, because a user can cancel a campaign during the minute a retry is in
+	// flight. Writing unconditionally would put a cancelled campaign back in the queue, where
+	// it would keep retrying and could eventually launch the instances they just cancelled.
+	try {
+		await markCampaign(entity, campaignId, {
+			active: true,
+			status: "AWAITING_CAPACITY",
+			spotFleetRequestId: AWAITING_CAPACITY_KEY,
+			provisioningModel: details.provisioningModel,
+			capacityWaitUntil: waitUntil
+		}, {
+			ConditionExpression: "attribute_not_exists(#status) OR #status IN (:available, :awaiting, :acquiring)",
+			ExpressionAttributeNames: {
+				"#status": "status"
+			},
+			ExpressionAttributeValues: {
+				":available": {S: "AVAILABLE"},
+				":awaiting": {S: "AWAITING_CAPACITY"},
+				":acquiring": {S: "ACQUIRING_CAPACITY"}
+			}
+		});
+	} catch (e) {
+		if (e.code == "ConditionalCheckFailedException") {
+			console.log(`[-] Campaign ${campaignId} is no longer waiting; not re-queuing it.`);
+			return respond(200, {}, "Campaign is no longer waiting for capacity.", false);
+		}
+
+		throw e;
+	}
+
+	const minutesLeft = Math.round((waitUntil - new Date().getTime()) / 60000);
+
+	console.log(`[*] No capacity for ${details.instanceCount} x ${details.instanceType} in ${details.region}; campaign ${campaignId} is waiting (${minutesLeft} minutes left).`);
+
+	return respond(202, {}, {
+		msg: `No capacity for ${details.instanceCount} x ${details.instanceType} in ${details.region} right now. The campaign will start automatically when capacity becomes available.`,
+		campaignId,
+		status: "AWAITING_CAPACITY",
+		waitUntil
+	}, true);
+}
+
+// A campaign that waited has outlived the presigned URL the user submitted with it - the
+// browser signs those for an hour. The object is in NPK's own bucket under a known key, so
+// the URL is re-signed here and the manifest the nodes read is rewritten before any of them
+// boot. Without this, every campaign that waited would launch nodes that can't fetch hashes.
+async function refreshHashFileUrl(entity, campaignId, manifest) {
+
+	if (!manifest.hashFile) {
+		throw new Error("Manifest has no hashFile key, so its download URL can't be re-signed.");
+	}
+
+	manifest.hashFileUrl = await s3.getSignedUrlPromise('getObject', {
+		Bucket: variables.userdata_bucket,
+		Key: `${entity}/${manifest.hashFile}`,
+		Expires: 3600
+	});
+
+	await s3.putObject({
+		Bucket: variables.userdata_bucket,
+		Key: `${entity}/campaigns/${campaignId}/manifest.json`,
+		Body: JSON.stringify(manifest)
+	}).promise();
+
+	console.log(`[+] Re-signed the hash file URL for campaign ${campaignId}.`);
+}
+
+// Hand a campaign back to the queue after a retry fails, so the next pass can pick it up
+// immediately instead of waiting out the claim lease. Failing to release is survivable -
+// that is exactly what the lease is for - so this only ever logs.
+function releaseCapacityClaim(entity, campaignId) {
+	return markCampaign(entity, campaignId, { status: "AWAITING_CAPACITY" })
+		.catch((e) => console.log(`[-] Failed to release the capacity claim on ${campaignId}.`, e));
+}
+
+// 'condition' is optional, and when present carries the ConditionExpression plus its
+// attribute names and values. AttributeUpdates and ConditionExpression can be combined; it's
+// UpdateExpression that can't be mixed with AttributeUpdates.
+function markCampaign(entity, campaignId, values, condition) {
+
+	const marshalled = aws.DynamoDB.Converter.marshall(values);
+
+	return ddb.updateItem({
+		Key: {
+			userid: {S: entity},
+			keyid: {S: `campaigns:${campaignId}`}
+		},
+		TableName: "Campaigns",
+		AttributeUpdates: Object.keys(marshalled).reduce((attrs, entry) => {
+			attrs[entry] = {
+				Action: "PUT",
+				Value: marshalled[entry]
+			};
+
+			return attrs;
+		}, {}),
+
+		...(condition ?? {})
+	}).promise();
 }
 
 // Resolve the published On-Demand rate for an instance type from the Pricing API. The API is

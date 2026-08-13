@@ -14,21 +14,38 @@ aws.config.apiVersions = {
 aws.config.update({region: settings.region});
 
 const db = new aws.DynamoDB();
+const lambda = new aws.Lambda();
 
-// How long an On-Demand fleet may hold zero instances before it's considered to have
-// failed to obtain capacity. Generous: On-Demand capacity resolves in seconds, so this
-// only has to clear the gap between createFleet returning and instances appearing.
-const NEVER_LAUNCHED_GRACE_MS = 15 * 60 * 1000;
+// Matches the sentinel execute_campaign writes onto a campaign that is waiting for capacity.
+// Every parked campaign shares it, so they can all be found with one query against the
+// existing 'SpotFleetRequests' index instead of scanning the table.
+const AWAITING_CAPACITY_KEY = "awaiting-capacity";
+
+// How long an On-Demand fleet may sit below the capacity its campaign was sized for before
+// it's considered to have failed to obtain it. Generous: On-Demand capacity resolves in
+// seconds, so this mostly has to clear the gap between createFleet returning and instances
+// appearing. It must stay *below* the node-side FLEET_WAIT_SECONDS in userdata.sh, so that
+// the monitor is the one that ends a doomed campaign and records a reason for it; the nodes'
+// own wait is only the backstop for when the monitor can't run.
+const CAPACITY_GRACE_MS = 8 * 60 * 1000;
+
+// Terminated instances stay visible in DescribeInstances for roughly an hour, after which a
+// healthy fleet that has lost a node starts to look under-capacity. The shortfall check is
+// therefore only trustworthy while the fleet is young enough for its full launch history to
+// still be readable, and runs in a bounded window rather than for the fleet's whole life.
+const CAPACITY_CHECK_WINDOW_MS = 45 * 60 * 1000;
 
 exports.main = async function(event, context, callback) {
 
 	// Spot and On-Demand campaigns are tracked through entirely different EC2 APIs, so each
 	// gets its own pass. They're independent: a failure in one must not mask the other, or
-	// leave the other's cost ceiling unenforced.
-	const passes = ["spot", "on-demand"];
+	// leave the other's cost ceiling unenforced. The pending pass is independent for the same
+	// reason - a campaign waiting for capacity must not stop the running ones being costed.
+	const passes = ["spot", "on-demand", "pending"];
 	const results = await Promise.allSettled([
 		processSpotFleets(),
-		processOnDemandFleets()
+		processOnDemandFleets(),
+		processPendingCampaigns()
 	]);
 
 	const messages = results.map((result, i) => {
@@ -444,6 +461,71 @@ async function processSpotFleets() {
 	return `[+] Reviewed [${Object.keys(spotFleets).length}] SFRs.`;
 };
 
+// Campaigns parked waiting for On-Demand capacity have no fleet to enumerate, so this pass
+// works from the campaign table instead. Retrying is deliberately not done here:
+// execute_campaign owns the launch path, the reservation attempt and the wait deadline, and
+// duplicating any of that would give two functions a say in when money starts being spent.
+// This only pokes it.
+async function processPendingCampaigns() {
+
+	const functionName = settings.execute_campaign_function;
+
+	if (!functionName) {
+		throw new Error("No execute_campaign function name configured; parked campaigns cannot be retried.");
+	}
+
+	let pending;
+
+	try {
+		pending = await db.query({
+			ExpressionAttributeValues: {
+				':s': { S: AWAITING_CAPACITY_KEY }
+			},
+			KeyConditionExpression: 'spotFleetRequestId = :s',
+			IndexName: "SpotFleetRequests",
+			TableName: "Campaigns"
+		}).promise();
+	} catch (e) {
+		console.log(e);
+		throw new Error(`Failed to retrieve campaigns awaiting capacity: ${e}`);
+	}
+
+	const campaigns = (pending.Items ?? []).map((item) => aws.DynamoDB.Converter.unmarshall(item));
+
+	if (!campaigns.length) {
+		return "[*] No campaigns awaiting capacity.";
+	}
+
+	console.log(`[+] Found ${campaigns.length} campaign(s) awaiting capacity.`);
+
+	// Invoked asynchronously: reserving capacity, building a launch template and creating a
+	// fleet runs well past this function's own 10 second timeout, and nothing here needs the
+	// result. A failed retry simply leaves the campaign parked for the next pass.
+	await Promise.all(campaigns.map(async (campaign) => {
+		const campaignId = campaign.keyid.split(':').slice(1).join(':');
+
+		try {
+			await lambda.invoke({
+				FunctionName: functionName,
+				InvocationType: "Event",
+				Payload: JSON.stringify({
+					internal: {
+						reason: "capacity-retry",
+						userid: campaign.userid,
+						campaignId
+					}
+				})
+			}).promise();
+
+			console.log(`[+] Asked execute_campaign to retry capacity for ${campaignId}.`);
+		} catch (e) {
+			console.log(`[!] Failed to trigger a capacity retry for ${campaignId}.`, e);
+		}
+	}));
+
+	return `[+] Triggered capacity retries for [${campaigns.length}] campaign(s).`;
+}
+
 async function processOnDemandFleets() {
 
 	let fleets = {};
@@ -575,27 +657,59 @@ async function processOnDemandFleets() {
 				console.log(`[!] Fleet ${fleetId} has ${unpricedInstances} instance(s) with no usable rate or launch time. Recorded cost is a lower bound.`);
 			}
 
+			// Every node divides the keyspace by its position in the fleet, so a fleet that
+			// never reaches the capacity its campaign was sized for cannot cover that
+			// keyspace: slices end up duplicated or never worked, and nothing surfaces an
+			// error. A partly filled fleet bills at full rate for a run that is guaranteed to
+			// be incomplete, which is worse than not running at all - so once capacity has
+			// had a fair chance to arrive, a short fleet is ended and told to say why.
+			//
+			// A missing target reads as 1, which preserves the older behaviour of reaping a
+			// fleet that obtained nothing at all.
+			const targetCapacity = fleet.TargetCapacitySpecification?.TotalTargetCapacity ?? 1;
+
+			if (instanceCount < targetCapacity && !isDeleted &&
+				fleetAge > CAPACITY_GRACE_MS && fleetAge < CAPACITY_CHECK_WINDOW_MS) {
+
+				console.log(`[!] Fleet ${fleetId} reached only ${instanceCount} of ${targetCapacity} instances within ${CAPACITY_GRACE_MS / 60000} minutes; deleting.`);
+
+				promises.push(deleteFleet(ec2, fleetId).then(() => {
+					console.log(`[+] Deleted ${fleetId} because it never obtained its full capacity.`);
+				}, (e) => {
+					console.log(`[-] Unable to delete under-capacity fleet ${fleetId}.`, e);
+				}));
+
+				// Distinct from COMPLETED on purpose. A campaign that died for want of
+				// capacity looking exactly like one that finished its work is the same class
+				// of silent failure as the split itself.
+				promises.push(editCampaignViaRequestId(fleetId, {
+					active: false,
+					price: fleet.price,
+					spotRequestHistory: fleet.history,
+					spotRequestStatus: fleet.instances,
+					status: "INSUFFICIENT_CAPACITY"
+				}).then(() => {
+					console.log(`[+] Marked campaign of ${fleetId} as INSUFFICIENT_CAPACITY`);
+				}, (e) => {
+					console.log(`[!] Failed attempting to update ${fleetId}`, e);
+				}));
+
+				// The reserved capacity is the expensive part; release it as soon as it's
+				// established that nothing is going to run in it.
+				promises.push(cancelCapacityReservation(ec2, fleet.tags.CampaignId));
+				promises.push(deleteLaunchTemplate(ec2, fleet.tags.CampaignId));
+
+				// Nothing below should also issue a delete for this fleet; two concurrent
+				// deleteFleets calls make the second fail and raise a spurious alert.
+				continue;
+			}
+
 			// Nodes power themselves off when they finish; reap the fleet once they've all gone.
 			if (!!instanceCount && !hasLiveInstances && !isDeleted) {
 				promises.push(deleteFleet(ec2, fleetId).then(() => {
 					console.log(`[+] Deleted ${fleetId} because all of its instances have stopped.`);
 				}, (e) => {
 					console.log(`[-] Unable to delete exhausted fleet ${fleetId}.`, e);
-				}));
-			}
-
-			// A 'request' type fleet makes one attempt at capacity; On-Demand either has it
-			// or it doesn't, and the answer comes back in seconds. A fleet still holding zero
-			// instances well past launch is never going to get any, and without this it sits
-			// marked RUNNING until ValidUntil expires - potentially hours of a campaign that
-			// appears live and is doing nothing.
-			if (!instanceCount && !isDeleted && fleetAge > NEVER_LAUNCHED_GRACE_MS) {
-				console.log(`[!] Fleet ${fleetId} launched no instances within ${NEVER_LAUNCHED_GRACE_MS / 60000} minutes; deleting.`);
-
-				promises.push(deleteFleet(ec2, fleetId).then(() => {
-					console.log(`[+] Deleted ${fleetId} because it never obtained capacity.`);
-				}, (e) => {
-					console.log(`[-] Unable to delete never-launched fleet ${fleetId}.`, e);
 				}));
 			}
 
@@ -615,8 +729,11 @@ async function processOnDemandFleets() {
 					console.log(`[!] Failed attempting to update ${fleetId}`, e);
 				}));
 
-				// The per-campaign launch template has no further use once the fleet is done.
+				// Neither the launch template nor the reserved capacity has any further use
+				// once the fleet is done. The reservation especially: it keeps billing at the
+				// full On-Demand rate until it's cancelled, however empty it is.
 				promises.push(deleteLaunchTemplate(ec2, fleet.tags.CampaignId));
+				promises.push(cancelCapacityReservation(ec2, fleet.tags.CampaignId));
 
 				continue;
 			}
@@ -782,6 +899,42 @@ function deleteLaunchTemplate(ec2, campaignId) {
 	});
 }
 
+// Released alongside the launch template on every terminal path. This one is not merely
+// tidy-up: an active reservation bills at the full On-Demand rate whether or not anything is
+// running inside it, so a reservation left behind by a finished campaign is an open-ended
+// charge for nothing. It's found by tag rather than by stored ID so that a campaign whose
+// database write failed still gets cleaned up.
+async function cancelCapacityReservation(ec2, campaignId) {
+	if (!campaignId) {
+		return;
+	}
+
+	try {
+		const reservations = await ec2.describeCapacityReservations({
+			Filters: [{
+				Name: "tag:CampaignId",
+				Values: [campaignId]
+			}, {
+				// 'active' is the only state worth cancelling; the rest are already over.
+				Name: "state",
+				Values: ["active"]
+			}]
+		}).promise();
+
+		for (const reservation of reservations.CapacityReservations ?? []) {
+			await ec2.cancelCapacityReservation({
+				CapacityReservationId: reservation.CapacityReservationId
+			}).promise().then(() => {
+				console.log(`[+] Released capacity reservation ${reservation.CapacityReservationId} for campaign ${campaignId}`);
+			}, (e) => {
+				console.log(`[-] Unable to release capacity reservation ${reservation.CapacityReservationId}.`, e);
+			});
+		}
+	} catch (e) {
+		console.log(`[-] Unable to look up capacity reservations for campaign ${campaignId}.`, e);
+	}
+}
+
 function criticalAlert(message) {
 	return new Promise((success, failure) => {
 		var sns = new aws.SNS({apiVersion: '2010-03-31', region: 'us-west-2'});
@@ -838,6 +991,14 @@ function editCampaign(entity, campaign, values) {
 // ID for spot campaigns and an EC2 Fleet ID for On-Demand ones.
 function editCampaignViaRequestId(spotFleetRequestId, values) {
 	return new Promise((success, failure) => {
+
+		// Every parked campaign shares this key, so a query for it returns an arbitrary one of
+		// them. Nothing should reach here with the sentinel - fleet IDs are what get passed -
+		// but updating a random waiting campaign is a bad enough outcome to rule out.
+		if (spotFleetRequestId == AWAITING_CAPACITY_KEY) {
+			return failure(new Error("Refusing to update a campaign via the awaiting-capacity sentinel."));
+		}
+
 		db.query({
 			ExpressionAttributeValues: {
 				':s': {S: spotFleetRequestId}
@@ -857,7 +1018,35 @@ function editCampaignViaRequestId(spotFleetRequestId, values) {
 			data = aws.DynamoDB.Converter.unmarshall(data.Items[0]);
 			console.log("[+] Found campaign " + data.keyid.split(':').slice(1));
 
-			editCampaign(data.userid, data.keyid.split(':').slice(1), values).then((updates) => {
+			// Cost and node state are recomputed from scratch on every pass, out of APIs that
+			// forget at different rates: terminated instances leave DescribeInstances after
+			// about an hour, while the fleet itself lingers for a day. Once the instances are
+			// gone the recompute yields zero, and a finished campaign's real cost and node
+			// list get overwritten with nothing, every minute, for the rest of that day.
+			//
+			// Spend only ever accrues and a node list only ever grows, so in both cases the
+			// smaller value is the stale one. Only the stored figure is clamped; enforcement
+			// below still runs on the freshly computed one.
+			const merged = { ...values };
+
+			if (merged.price !== undefined && Number(data.price ?? 0) > Number(merged.price)) {
+				console.log(`[-] Keeping recorded price $${data.price} over recomputed $${merged.price} for ${spotFleetRequestId}.`);
+				delete merged.price;
+			}
+
+			if (!!merged.spotRequestStatus && !Object.keys(merged.spotRequestStatus).length &&
+				!!data.spotRequestStatus && !!Object.keys(data.spotRequestStatus).length) {
+
+				console.log(`[-] Keeping ${Object.keys(data.spotRequestStatus).length} recorded instance(s) over an empty recompute for ${spotFleetRequestId}.`);
+				delete merged.spotRequestStatus;
+			}
+
+			// updateItem rejects an empty AttributeUpdates, and there's nothing to write.
+			if (!Object.keys(merged).length) {
+				return success(null);
+			}
+
+			editCampaign(data.userid, data.keyid.split(':').slice(1), merged).then((updates) => {
 				success(updates);
 			}, failure);
 		});

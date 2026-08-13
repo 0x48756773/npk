@@ -29,6 +29,26 @@ angular
         return typeof what;
       };
 
+      // Campaign statuses are stored as bare tokens and were previously rendered raw. The
+      // capacity states in particular need explaining: a campaign can now sit queued without
+      // having launched anything, which looks like a stall unless the UI says otherwise.
+      // Defined on the parent scope so both the dashboard and campaign management inherit it.
+      $scope.statusLabel = function(status) {
+        switch (status) {
+          case "AWAITING_CAPACITY":
+            return "Waiting for capacity";
+
+          case "ACQUIRING_CAPACITY":
+            return "Reserving capacity";
+
+          case "INSUFFICIENT_CAPACITY":
+            return "No capacity available";
+
+          default:
+            return status;
+        }
+      };
+
       $scope.settings = { self: {}, admin: {} };
       $scope.getSettings = function() {
 

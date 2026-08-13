@@ -126,14 +126,85 @@ echo "* * * * * root /root/monitor_instance_action.sh" >> /etc/crontab
 # Each node works a slice of the keyspace determined by its position in the fleet, so this
 # enumeration has to succeed for either provisioning model. If it returns a single node when
 # there are really several, every node grinds the same slice.
-if [[ -n "$SpotFleet" ]]; then
-	aws ec2 describe-spot-fleet-instances --region $REGION --spot-fleet-request-id $SpotFleet | jq '.ActiveInstances[].InstanceId' | sort > fleet_instances
-else
-	aws ec2 describe-fleet-instances --region $REGION --fleet-id $Fleet | jq '.ActiveInstances[].InstanceId' | sort > fleet_instances
+#
+# Enumerating once at boot is not enough. Fleets fill asynchronously, and On-Demand capacity
+# in particular can trickle in over many minutes. A node that boots early sees a short list,
+# and because the list is sorted by instance ID a node that boots late can still sort ahead
+# of it - so two nodes both claim slot 1, grind identical keyspace, and the remainder is
+# never worked. Nothing anywhere reports an error; the campaign simply finds nothing.
+#
+# Waiting for the fleet to reach the capacity the campaign was launched with means every node
+# divides the same complete set, so the slices agree.
+export TARGETCOUNT={{INSTANCECOUNT}}
+
+# spot_monitor deletes an under-capacity fleet well before this expires, and marks the
+# campaign with the reason. This is the backstop for when the monitor can't: it must stay
+# longer than the monitor's grace period so that the monitor's explanation is the one the
+# user sees in the normal case.
+FLEET_WAIT_SECONDS=600
+FLEET_POLL_SECONDS=15
+
+# There is no correct slice to work once the split is unknowable, so the node stops instead
+# of duplicating another node's. /potfiles holds a symlink to this log, so syncing before
+# shutdown is what carries the reason off the box.
+abort_node() {
+	echo "[!] $1"
+	echo "$1" > /potfiles/$${INSTANCEID}-aborted.txt
+
+	aws --region $USERDATAREGION s3 sync /potfiles/ s3://$USERDATA/$ManifestPath/potfiles/ --include "*$${INSTANCEID}*"
+
+	if [[ ! -f /root/nodeath ]]; then
+		poweroff
+	fi
+
+	exit 1
+}
+
+enumerate_fleet() {
+	if [[ -n "$SpotFleet" ]]; then
+		aws ec2 describe-spot-fleet-instances --region $REGION --spot-fleet-request-id $SpotFleet | jq '.ActiveInstances[].InstanceId' | sort > fleet_instances
+	else
+		aws ec2 describe-fleet-instances --region $REGION --fleet-id $Fleet | jq '.ActiveInstances[].InstanceId' | sort > fleet_instances
+	fi
+}
+
+# An unsubstituted or malformed target leaves no way to know how many slices to cut. Running
+# the whole keyspace on this node costs more than it should, but it covers all of it; a wrong
+# split silently leaves candidates untried, which is the failure this block exists to prevent.
+if ! [[ "$TARGETCOUNT" =~ ^[0-9]+$ ]] || [[ $TARGETCOUNT -lt 1 ]]; then
+	echo "[!] No usable target instance count ('$TARGETCOUNT'); working the full keyspace on this node."
+	TARGETCOUNT=1
 fi
 
-export INSTANCECOUNT=$(cat fleet_instances | wc -l)
-export INSTANCENUMBER=$(cat fleet_instances | grep -nr $INSTANCEID - | cut -d':' -f1)
+FLEET_DEADLINE=$(( $(date +%s) + FLEET_WAIT_SECONDS ))
+
+while true; do
+	enumerate_fleet
+	FLEETSIZE=$(cat fleet_instances | wc -l)
+
+	if [[ $FLEETSIZE -ge $TARGETCOUNT ]]; then
+		echo "[*] Fleet holds $FLEETSIZE of $TARGETCOUNT requested instances; dividing the keyspace."
+		break
+	fi
+
+	if [[ $(date +%s) -ge $FLEET_DEADLINE ]]; then
+		abort_node "Fleet reached only $FLEETSIZE of $TARGETCOUNT instances after $FLEET_WAIT_SECONDS seconds. The keyspace cannot be divided correctly, so this node is stopping rather than duplicating another node's slice."
+	fi
+
+	echo "[*] Fleet holds $FLEETSIZE of $TARGETCOUNT requested instances; re-checking in $FLEET_POLL_SECONDS seconds."
+	sleep $FLEET_POLL_SECONDS
+done
+
+# Both values come from the same listing, so they cannot disagree about the set being split.
+# A fleet that overshot its target still divides cleanly - every node gets exactly one slice.
+export INSTANCECOUNT=$FLEETSIZE
+export INSTANCENUMBER=$(cat fleet_instances | grep -n $INSTANCEID | cut -d':' -f1)
+
+# The wrapper defaults a missing position to 1, which is another route to two nodes sharing a
+# slice. A node absent from its own fleet listing cannot know which slice is its own.
+if [[ -z "$INSTANCENUMBER" ]]; then
+	abort_node "Instance $INSTANCEID does not appear in its own fleet listing of $FLEETSIZE instances. Cannot determine which slice of the keyspace to work."
+fi
 
 if [[ `lspci | grep AMD | wc -l` -gt 0 ]]; then
 	# Need to compile Hashcat for AL2's old GLIBC

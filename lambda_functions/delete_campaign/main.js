@@ -137,6 +137,28 @@ exports.main = async function(event, context, callback) {
 	}).promise();
 
 	switch (campaign.status) {
+
+		// The campaign never launched: it's sitting in the queue waiting for On-Demand
+		// capacity, with no fleet and no template to tear down. Marking it cancelled is the
+		// whole job - execute_campaign only claims campaigns that are still AWAITING_CAPACITY,
+		// so this is also what stops the retries.
+		//
+		// ACQUIRING_CAPACITY means a retry is mid-flight. It may already hold a reservation,
+		// in which case it either parks - and finds this cancellation, because that write is
+		// conditional - or completes the launch and records the fleet, which the user can then
+		// cancel again. Either way nothing is stranded untracked.
+		case "AWAITING_CAPACITY":
+		case "ACQUIRING_CAPACITY":
+
+			try {
+				await markCancelled();
+			} catch(e) {
+				console.log("Failed to deactivate campaign.", e);
+				return respond(500, {}, "Failed to deactivate campaign.", false);
+			}
+
+			return respond(200, {}, "Campaign cancelled while waiting for capacity.", true);
+
 		case "STARTING":
 		case "RUNNING":
 
@@ -189,6 +211,20 @@ exports.main = async function(event, context, callback) {
 						console.log(`[-] Unable to delete launch template for campaign ${campaignId}.`, e);
 					}
 				});
+
+				// Releasing the reserved capacity is the part that actually stops the meter:
+				// it bills at the full On-Demand rate until cancelled, however empty it is.
+				// The monitor sweeps for this too, but a user who cancels a campaign should
+				// not have to wait a minute for the charges to stop.
+				if (!!campaign.capacityReservationId && campaign.capacityReservationId != "<none>") {
+					await ec2.cancelCapacityReservation({
+						CapacityReservationId: campaign.capacityReservationId
+					}).promise().then(() => {
+						console.log(`[+] Released capacity reservation ${campaign.capacityReservationId}.`);
+					}, (e) => {
+						console.log(`[-] Unable to release capacity reservation ${campaign.capacityReservationId}.`, e);
+					});
+				}
 
 			} else {
 
