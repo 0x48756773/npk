@@ -103,14 +103,17 @@ jq -r '.rulesFiles[]' manifest.json | xargs -L1 -I'{}' rm -f ./npk-{}
 # Link the output file to potfiles
 ln -s /var/log/cloud-init-output.log /potfiles/$${INSTANCEID}-output.log
 
-echo <<EOF > /root/monitor_instance_action.sh
+# NOTE: unquoted heredoc on purpose. $USERDATAREGION/$USERDATA/$ManifestPath/$${INSTANCEID}
+# must be baked in here, because cron runs this script with a bare environment.
+# Anything that has to run when the script runs (TOKEN, ACTIONS) is escaped as \$.
+cat <<EOF > /root/monitor_instance_action.sh
 #! /bin/bash
 
 TOKEN=\`curl -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600"\`
-ACTIONS=\$(curl -s --head -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/spot/intance_action | grep 404 | wc -l)
+ACTIONS=\$(curl -s --head -H "X-aws-ec2-metadata-token: \$TOKEN" http://169.254.169.254/latest/meta-data/spot/instance-action | grep 404 | wc -l)
 if [[ \$ACTIONS -ne 1 ]]; then
-	wget "--header=X-aws-ec2-metadata-token: $TOKEN" -O /potfiles/$${INSTANCEID}-instance_action.json http://169.254.169.254/latest/meta-data/spot/intance_action
-	aws --region $USERDATAREGION s3 sync /potfiles/ s3://$USERDATA/$ManifestPath/potfiles/ --include \"*$${INSTANCEID}*\"
+	wget "--header=X-aws-ec2-metadata-token: \$TOKEN" -O /potfiles/$${INSTANCEID}-instance_action.json http://169.254.169.254/latest/meta-data/spot/instance-action
+	/usr/local/bin/aws --region $USERDATAREGION s3 sync /potfiles/ s3://$USERDATA/$ManifestPath/potfiles/ --include "*$${INSTANCEID}*"
 fi
 EOF
 

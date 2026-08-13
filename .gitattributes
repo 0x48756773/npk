@@ -3,3 +3,6 @@
 # "$'\r': command not found", which gives no useful hint about the real cause.
 *.sh text eol=lf
 *.tpl text eol=lf
+
+# Keep this file consistent with the rule it defines.
+.gitattributes text eol=lf
