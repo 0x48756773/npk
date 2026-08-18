@@ -271,19 +271,38 @@ exports.main = async function(event, context, callback) {
 	try {
 
 		// Verify hashfile metadata.
-		await s3.headObject({
+		const hashFileHead = await s3.headObject({
 				Bucket: variables.userdata_bucket,
 				Key: entity + '/' + campaign.hashFile
-		}).promise().then((data) => {
+		}).promise();
 
-			if (data.ContentType.indexOf("text/plain") != 0) {
-				return respond(400, {}, "Content Type " + data.ContentType + " not permitted. Use text/plain.", false);
-			}
+		if (hashFileHead.ContentType.indexOf("text/plain") != 0) {
+			return respond(400, {}, "Content Type " + hashFileHead.ContentType + " not permitted. Use text/plain.", false);
+		}
 
-			knownMetadata[variables.dictionaryBucket + ":" + campaign.dictionaryFile] = data.Metadata;
-			verifiedManifest.hashFile = campaign.hashFile;
+		knownMetadata[variables.dictionaryBucket + ":" + campaign.dictionaryFile] = hashFileHead.Metadata;
+		verifiedManifest.hashFile = campaign.hashFile;
 
-			return true;
+		// Hash files are uploaded straight from the browser and never pass through
+		// compression_pipe, so unlike dictionary/rules files they carry no "lines"
+		// S3 metadata. Count them here so the dashboard has a real hash count from
+		// the moment the campaign is created, rather than the 0 it would otherwise
+		// show until a node boots and posts its first status report.
+		hashfilelines = await new Promise((resolve, reject) => {
+			let lines = 0;
+			let endsWithNewline = true;
+
+			s3.getObject({
+				Bucket: variables.userdata_bucket,
+				Key: entity + '/' + campaign.hashFile
+			}).createReadStream()
+			.on('data', (chunk) => {
+				const text = chunk.toString();
+				lines += (text.match(/\n/g) || []).length;
+				endsWithNewline = text.endsWith('\n');
+			})
+			.on('end', () => resolve(endsWithNewline ? lines : lines + 1))
+			.on('error', reject);
 		});
 
 	} catch (err) {
@@ -468,7 +487,7 @@ exports.main = async function(event, context, callback) {
 			active: false,
 			durationSeconds: verifiedManifest.instanceDuration * 3600,
 			hashType: verifiedManifest.hashType,
-			hashes: 0,
+			hashes: hashfilelines,
 			instanceCount: verifiedManifest.instanceCount,
 			price: 0,
 			targetPrice: verifiedManifest.priceTarget,
