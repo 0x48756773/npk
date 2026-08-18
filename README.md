@@ -42,8 +42,7 @@ Take the trial-and-error out of complex attack types with the intuitive campaign
 
 Pick your provisioning model at the top and everything below it re-derives from your account's entitlements for that model, so every GPU family, region, and instance size you're offered is one you can actually launch.
 
-![campaign_builder](<img width="908" height="485" alt="image-1787065719035" src="https://github.com/user-attachments/assets/4d35687a-225b-4b51-8ccd-1f36e6d2f94f" />
-)
+![campaign_builder](https://github.com/user-attachments/assets/4d35687a-225b-4b51-8ccd-1f36e6d2f94f)
 
 ### 3. Campaign price and coverage estimates
 
