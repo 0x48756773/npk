@@ -10,6 +10,8 @@ NPK is a distributed hash-cracking platform built entirely of serverless compone
 
 Let's face it - even the beastliest cracking rig spends a lot of time at idle. You sink a ton of money up front on hardware, then have the electricity bill to deal with. NPK lets you leverage extremely powerful hash cracking with the 'pay-as-you-go' benefits of AWS. For example, you can crank out 336 GH/s of NTLM for a mere $1/hr and scale it however you want. NPK was also designed to fit easily within the free tier while you're not using it! Without the free tier, it'll still cost less than $1 per MONTH to have online!
 
+Every campaign is provisioned one of two ways: **Spot**, which is the cheapest way to crack but can be reclaimed by AWS at any moment, or **On-Demand**, which costs more per hour and cannot be interrupted. You choose per campaign, in the campaign builder.
+
 ## Features
 
 ### 1. Super easy install
@@ -38,7 +40,9 @@ There are also [Step-by-step instructions](https://github.com/c6fc/npk/wiki/Step
 
 Take the trial-and-error out of complex attack types with the intuitive campaign builder. With a couple clicks you can create advanced campaigns that even advanced Hashcat users would struggle to emulate.
 
-![gpu_families](https://user-images.githubusercontent.com/143415/156901010-a6ae07e8-273b-496c-8916-b0d8955d840f.png)
+Pick your provisioning model at the top and everything below it re-derives from your account's entitlements for that model, so every GPU family, region, and instance size you're offered is one you can actually launch.
+
+![campaign_builder](docs/images/campaign-builder.png)
 
 ### 3. Campaign price and coverage estimates
 
@@ -46,29 +50,83 @@ Take the guess-work out of your campaigns. See how far you'll get and how much i
 
 ![coverage](https://user-images.githubusercontent.com/143415/156901016-a63b2ea1-fcf0-4a48-99c5-a1c6ab2e3221.png)
 
+The estimate shows its working - instance count &times; instance type &times; hourly rate &times; hours - and tells you how much to trust it. On-Demand rates are published and fixed, so the estimate is the price. Spot rates move, so it isn't.
+
 ### 4. Spot or On-Demand provisioning
 
 Pick how each campaign is provisioned right in the campaign builder. **Spot** is the cheapest way to crack and is the right default, but AWS can reclaim the instances at any time and end your campaign early. **On-Demand** costs more per hour and cannot be interrupted, which matters when a campaign has to finish on a schedule.
 
-Prices, quotas, and available instance sizes all update to match the model you select.
+Toggling the model rebuilds the whole selection from scratch. Prices, quotas, available regions, and the set of instance sizes you can afford all differ between the two, so nothing carries over.
+
+On-Demand rates are resolved from the AWS Pricing API at deploy time and baked into the console, which is what keeps the campaign builder responsive. The rate that actually governs spend is re-resolved server-side when the campaign launches, so a stale console price can't quietly raise your bill.
 
 **Note:** Spot and On-Demand draw on *separate* AWS service quotas. A healthy Spot quota tells you nothing about your On-Demand quota, which is zero by default on many accounts. Check the 'Quota' page in the NPK console before planning an On-Demand campaign, and request an increase to *Running On-Demand G and VT instances* (or *Running On-Demand P instances*) if you need one.
 
-### 5. Max price enforcement and runaway instance protection
+### 5. Per-model quota visibility
+
+The Quota page has its own Spot / On-Demand toggle and shows entitlements for one model at a time, because they are genuinely separate limits with separate quota codes. Regions where you hold no usable quota are called out rather than silently omitted.
+
+If a model leaves you with nothing to launch, the campaign builder says so and links you to the Quota page instead of spinning forever - which is the usual first experience of On-Demand on a fresh account.
+
+### 6. Full-fleet starts and the capacity queue
+
+Every node works a slice of the keyspace determined by its position in the fleet, so a fleet that starts half-full doesn't just run slower - it works the wrong slices, and nothing reports an error. NPK won't do that.
+
+For On-Demand campaigns, capacity is reserved *before* anything is launched. A reservation is per-availability-zone and all-or-nothing: AWS either holds the full instance count or refuses, and a refusal costs nothing. NPK walks the zones in your chosen region until one takes the whole request, then launches the fleet directly into that reservation so it fills completely and at once.
+
+If no zone has room, the campaign is parked instead of launched. It sits in the queue costing nothing while NPK retries every minute for up to 6 hours, and starts the moment capacity appears. You'll see it move through these states on the dashboard:
+
+| Status | Meaning |
+|---|---|
+| Waiting for capacity | Parked in the queue. Nothing is running and nothing is being billed. |
+| Reserving capacity | A launch attempt is in flight right now. |
+| No capacity available | The campaign waited out its deadline, or its fleet never filled. It was ended rather than run incorrectly. |
+
+Cancelling a queued campaign stops the retries immediately.
+
+### 7. Max price enforcement and runaway instance protection
 
 GPU instances are expensive. Runaway GPU instances are EXTREMELY expensive. NPK will enforce a maximum campaign price limit, and was designed to prevent runaway instances even with a complete failure of the management plane.
 
-On-Demand campaigns are launched as EC2 Fleets with an expiry attached, so AWS itself terminates the instances when the campaign's time or budget runs out &mdash; even if every Lambda in the account stops running.
+On-Demand campaigns are launched as EC2 Fleets with an expiry attached, so AWS itself terminates the instances when the campaign's time or budget runs out &mdash; even if every Lambda in the account stops running. That expiry is bounded by whichever runs out first: the duration you asked for, or the point at which the fleet would burn through the campaign's cost ceiling. A budget too small to buy even a minute of runtime is rejected up front, before anything is created.
 
-### 6. Multi-Tenancy & SAML-based single sign-on
+Reserved capacity bills at the full On-Demand rate whether or not anything is running in it, so NPK releases it on every path that ends a campaign - completion, cancellation, teardown, or a failed launch. Cancelling from the console stops the meter right away rather than waiting for the next monitor pass.
+
+The monitor also reaps On-Demand fleets that never reached the capacity their campaign was sized for, marking them 'No capacity available' rather than letting a partly-filled fleet bill at full rate for a run that can't be correct. The nodes carry a backstop for the same condition: a node that can't establish its position in a complete fleet shuts itself down instead of guessing.
+
+Spot and On-Demand campaigns are tracked by independent monitor passes, so a failure in one can never leave the other's cost ceiling unenforced.
+
+### 8. Multi-Tenancy & SAML-based single sign-on
 
 NPK supports multiple users, with strict separation of data, campaigns, and results between each user. It can optionally integrate with SAML-based federated identity providers to enable large teams to use NPK with minimal effort.
 
 ![user_administration](https://user-images.githubusercontent.com/143415/156901873-6c89bb50-5268-4382-aebd-e45ee5ff2f9f.png)
 
-### 7. Data lifecycle management
+### 9. Data lifecycle management
 
 Configure how long data will stay in NPK with configurable lifecycle durations during installation. Hashfiles and results are automatically removed after this much time to keep things nicely cleaned up.
+
+## Choosing between Spot and On-Demand
+
+|  | Spot | On-Demand |
+|---|---|---|
+| Cost per hour | Lowest | Higher, fixed |
+| Interruption | AWS can reclaim at any time | Never |
+| Price stability | Rates move; final cost varies | Published rate; the estimate is the price |
+| Account quota | *All G and VT Spot Instance Requests* | *Running On-Demand G and VT instances* (P families have their own limit) |
+| Capacity behaviour | Fleet fills as capacity allows | Capacity reserved up front; campaign queues if none is available |
+| AWS API | Spot Fleet Request | EC2 Fleet + Capacity Reservation |
+
+Spot remains the default and the right choice for most work. Reach for On-Demand when a campaign has to finish on a schedule, when Spot capacity for your chosen GPU family keeps failing, or when an interruption would cost you more than the rate difference.
+
+### Requesting an On-Demand quota increase
+
+New AWS accounts are typically entitled to zero On-Demand GPU instances. From the AWS console, go to **Service Quotas &rarr; AWS services &rarr; Amazon EC2** in the region you want to run in, then request an increase to:
+
+- **Running On-Demand G and VT instances** (`L-DB2E81BA`) - covers the G4, G5, G6, and G6e families
+- **Running On-Demand P instances** (`L-417A185B`) - covers P4d and other A100-class instances
+
+Quotas are denominated in vCPUs rather than instances, and are per-region. Run `npm run update` once an increase is granted so NPK picks up the new entitlements.
 
 ## Easy Install
 
@@ -90,6 +148,8 @@ When the deploy finishes, you'll be dropped to a custom prompt, which indicates 
 If you said 'no' at the end of the wizard, you can run `npm run deploy` from this prompt to finish the deployment.
 
 See https://github.com/c6fc/npk/wiki/Detailed-NPK-Settings for more details about advanced configurations, or https://github.com/c6fc/npk/wiki/Configuring-SAML-SSO for help configuring SAML SSO.
+
+The deploy collects both Spot and On-Demand quotas for every configured region, resolves published On-Demand rates from the Pricing API, and creates the `AWSServiceRoleForEC2Fleet` service-linked role if the account doesn't already have one. None of these are fatal if they fail - a region NPK can't price, or can't read a quota for, is simply not offered for that model.
 
 ## Connect to an existing installation
 
@@ -115,6 +175,8 @@ cloudshell-user$ source <(curl -sL https://raw.githubusercontent.com/0x48756773/
 < ... change your settings however you need >
 @c6fc/npk> npm run update
 ```
+
+Run `npm run update` after an AWS quota increase as well - quotas and On-Demand prices are resolved at deploy time and baked into the console.
 
 ## Uploading your own dictionaries and rule files
 
