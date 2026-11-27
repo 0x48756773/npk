@@ -73,9 +73,27 @@ function getHashcatParams(manifest) {
 		manifest.attackType
 	];
 
-	if (manifest.manualArguments) {
-		console.log("Adding manual arguments:", manifest.manualArguments.split(" "));
-		params = params.concat(manifest.manualArguments.split(" "));
+	var manualArguments = manifest.manualArguments ? manifest.manualArguments.split(" ") : [];
+
+	// Optimized kernels are on unless the campaign turned them off. The campaign builder shows
+	// -O in the command it says every node runs, and its speed estimates were benchmarked with
+	// it, but this wrapper had stopped passing it. Nodes then quietly ran pure kernels and, for
+	// fast hash types, delivered a fraction of the hashrate the estimate was built on. Manifests
+	// from before the option existed have no field, and get what the builder showed them.
+	//
+	// It sits in the base parameters so that the --keyspace pass below and the real run use the
+	// same kernel, and so divide the keyspace in the same units.
+	var alreadyOptimized = manualArguments.some(function (arg) {
+		return arg == "-O" || arg == "--optimized-kernel-enable";
+	});
+
+	if (manifest.optimizedKernels !== false && !alreadyOptimized) {
+		params.push("-O");
+	}
+
+	if (manualArguments.length > 0) {
+		console.log("Adding manual arguments:", manualArguments);
+		params = params.concat(manualArguments);
 	}
 
 	params = params.concat([

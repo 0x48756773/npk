@@ -469,6 +469,32 @@
                                     </div>
                                     <div class="col-lg-12" style="margin-top: 25px;">
                                       <div class="form-group row">
+                                        <label for="optimized_kernels" class="col-sm-2 col-form-label">Optimized Kernels</label>
+                                        <div class="col-sm-10 input-group">
+                                          <div class="input-group-prepend">
+                                            <div class="input-group-text">
+                                              <small>
+                                                -O
+                                              </small>
+                                              <input type="checkbox" class="ml-2" id="optimized_kernels" name="optimized_kernels" ng-model="optimized_kernels" ng-disabled="!use_manual">
+                                            </div>
+                                          </div>
+                                          <div class="form-control text-left" style="height: auto;">
+                                            <span ng-show="optimized_kernels">Enabled (default). Much faster for fast hash types; candidates longer than the kernel's limit (usually 31 characters) are rejected.</span>
+                                            <span ng-show="!optimized_kernels">Disabled. Pure kernels accept any candidate length but run well below the speeds the estimates assume.</span>
+                                          </div>
+                                          <span class="input-group-append">
+                                            <div class="input-group-text">
+                                              <div type="button" class="badge badge-outline-secondary" data-toggle="tooltip" data-placement="top" data-original-title="Passes -O to hashcat on every node. Price and duration estimates are benchmarked with optimized kernels. Turn off only if you need candidates longer than the optimized kernel allows.">
+                                                <i class="fa fa-question-circle"></i>
+                                              </div>
+                                            </div>
+                                          </span>
+                                        </div>
+                                      </div>
+                                    </div>
+                                    <div class="col-lg-12" style="margin-top: 25px;">
+                                      <div class="form-group row">
                                         <label for="target_override" class="col-sm-2 col-form-label">Manual Mask</label>
                                         <div class="col-sm-10 input-group">
                                           <div class="input-group-prepend">

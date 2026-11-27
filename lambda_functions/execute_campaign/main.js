@@ -49,15 +49,36 @@ const CAPACITY_CLAIM_LEASE_MS = 5 * 60 * 1000;
 let cb = "";
 let origin = "";
 let variables = {};
+let responded = false;
 
 const cognito = new aws.CognitoIdentityServiceProvider({region: accountDetails.primaryRegion, apiVersion: "2016-04-18"});
 
 exports.main = async function(event, context, callback) {
 
-	console.log(JSON.stringify(event));
-
 	// Hand off the callback function for later.
 	cb = callback;
+	responded = false;
+
+	// Anything that escapes the handler becomes a Lambda error, which API Gateway answers with a
+	// bare 502 carrying no CORS headers. The browser can't read that at all, so the dashboard
+	// could only report that it failed to parse the response, with nothing in it to say why.
+	// Every failure therefore goes back through respond(), which the browser can read.
+	try {
+		return await startCampaign(event);
+	} catch (e) {
+		console.log("[!] Unhandled error while starting campaign.", e);
+		return respond(500, {}, `Unexpected error while starting the campaign: ${e?.message ?? e}`, false);
+	}
+};
+
+async function startCampaign(event) {
+
+	console.log(JSON.stringify(event));
+
+	// Hand off the origin, too. Fix for weird case. Taken before anything can fail, so that every
+	// error response carries the CORS header the browser needs to read it. Absent, as it should
+	// be, on the monitor's internal capacity retries.
+	origin = event?.headers?.origin ?? event?.headers?.Origin;
 
 	// Get the available envvars into a usable format.
 	variables = JSON.parse(JSON.stringify(process.env));
@@ -91,8 +112,8 @@ exports.main = async function(event, context, callback) {
 		// was only populated by luck, via the unrelated awaits that happen to follow.
 		await Promise.all(promises);
 	} catch (e) {
-		console.log(e);
-		return callback(`[!] Failed to retrieve subnets for VPC: ${e}`);
+		console.log("[!] Failed to retrieve subnets for VPC.", e);
+		return respond(500, {}, `Failed to retrieve subnets for the NPK VPCs: ${e?.message ?? e}`, false);
 	}
 
 	// spot_monitor re-invokes this function for campaigns parked waiting on capacity. That
@@ -121,9 +142,6 @@ exports.main = async function(event, context, callback) {
 
 		console.log("Received event: " + JSON.stringify(event));
 
-		// Hand off the origin, too. Fix for weird case
-		origin = event?.headers?.origin ?? event?.headers?.Origin;
-
 		var allowed_characters = /^[a-zA-Z0-9'"%\.\[\]\{\}\(\)\-\:\\\/\;\=\?\#\_+\s,!@#\$\^\*&]+$/;
 		if (!allowed_characters.test(JSON.stringify(event))) {
 			console.log("Request contains illegal characters");
@@ -142,7 +160,7 @@ exports.main = async function(event, context, callback) {
 
 		if (!UserPoolId || !sub) {
 			console.log(`UserPoolId or sub is missing from ${event?.requestContext?.identity?.cognitoAuthenticationProvider}`);
-			respond(401, {}, "Authorization Required", false);
+			return respond(401, {}, "Authorization Required", false);
 		}
 
 	} catch (e) {
@@ -894,8 +912,44 @@ async function acquireCapacityReservation(ec2, params) {
 	// only bounds how long an orphaned reservation could bill for, so it's kept close: the
 	// fleet's own ValidUntil is what actually ends the campaign.
 	const endDate = new Date(new Date().getTime() + (Math.max(hours, 1) * 3600 * 1000) + (15 * 60 * 1000));
+	const region = ec2.config.region;
 
-	for (const az of zones) {
+	// NPK builds a subnet in every zone of a region, but GPU types are rarely offered in all of
+	// them. Asking for a reservation in a zone that doesn't carry the type is refused as
+	// 'Unsupported' - "The requested configuration is currently not supported" - which says
+	// nothing about capacity. Spot and EC2 Fleet quietly skip such zones; a reservation has to
+	// be told exactly where to go, so the list is narrowed to zones that actually offer it.
+	let candidateZones = zones;
+
+	try {
+		const offerings = await ec2.describeInstanceTypeOfferings({
+			LocationType: "availability-zone",
+			Filters: [{
+				Name: "instance-type",
+				Values: [instanceType]
+			}]
+		}).promise();
+
+		const offered = new Set((offerings.InstanceTypeOfferings ?? []).map((offering) => offering.Location));
+		candidateZones = zones.filter((az) => offered.has(az));
+
+		console.log(`[*] ${instanceType} is offered in [${[...offered].join(', ')}] of ${region}; trying [${candidateZones.join(', ')}].`);
+	} catch (e) {
+		// Not fatal. The per-zone handling below copes with a zone that doesn't carry the type;
+		// it just costs a refused call to find out.
+		console.log(`[-] Unable to list the zones offering ${instanceType} in ${region}; trying every zone.`, e);
+	}
+
+	if (!candidateZones.length) {
+		throw new Error(`${instanceType} is not offered in any Availability Zone of ${region} that NPK has a subnet in (${zones.join(', ')}).`);
+	}
+
+	// Zones that refused for want of capacity, versus zones that refused the configuration
+	// outright. Only the first is something waiting can fix.
+	let capacityRefused = false;
+	const unsupported = [];
+
+	for (const az of candidateZones) {
 		try {
 			const result = await ec2.createCapacityReservation({
 				InstanceType: instanceType,
@@ -936,7 +990,17 @@ async function acquireCapacityReservation(ec2, params) {
 		} catch (e) {
 			// No room in this zone is the expected answer while waiting, not a failure.
 			if (e.code == "InsufficientInstanceCapacity" || e.code == "InsufficientCapacity") {
+				capacityRefused = true;
 				console.log(`[-] No capacity for ${instanceCount} x ${instanceType} in ${az}.`);
+				continue;
+			}
+
+			// This zone can't hold the configuration at all, which is a property of the zone
+			// rather than of the request, so another zone may still take it. This used to be
+			// rethrown, which ended the whole walk at the first zone that didn't carry the type.
+			if (e.code == "Unsupported") {
+				console.log(`[-] ${az} refused ${instanceCount} x ${instanceType} as unsupported: ${e.message}`);
+				unsupported.push({ az, message: e.message });
 				continue;
 			}
 
@@ -944,6 +1008,20 @@ async function acquireCapacityReservation(ec2, params) {
 			// forever after, so it surfaces to the user instead of looking like patience.
 			throw e;
 		}
+	}
+
+	// Every zone rejected the configuration and none of them was merely full. Nothing about
+	// that changes with time, so parking the campaign would only make it wait out its deadline
+	// in silence; say so instead.
+	if (!capacityRefused && unsupported.length) {
+		const byReason = unsupported.reduce((reasons, { az, message }) => {
+			(reasons[message] ??= []).push(az);
+			return reasons;
+		}, {});
+
+		const detail = Object.entries(byReason).map(([message, azs]) => `${azs.join(', ')}: ${message}`).join(' ');
+
+		throw new Error(`No Availability Zone in ${region} will reserve ${instanceCount} x ${instanceType}. ${detail}`);
 	}
 
 	return null;
@@ -1036,11 +1114,28 @@ function releaseCapacityClaim(entity, campaignId) {
 }
 
 // 'condition' is optional, and when present carries the ConditionExpression plus its
-// attribute names and values. AttributeUpdates and ConditionExpression can be combined; it's
-// UpdateExpression that can't be mixed with AttributeUpdates.
+// attribute names and values.
+//
+// The write is built as an UpdateExpression so that it can carry a condition at all. DynamoDB
+// refuses any request that mixes the legacy AttributeUpdates parameter with expression
+// parameters such as ConditionExpression, and it does so with a ValidationException rather than
+// a conditional failure. An earlier version did exactly that, so every attempt to park a
+// campaign threw out of the handler, and the dashboard reported an unparseable response.
 function markCampaign(entity, campaignId, values, condition) {
 
 	const marshalled = aws.DynamoDB.Converter.marshall(values);
+
+	// Every field goes through a placeholder, so reserved words such as 'status' need no special
+	// handling. The prefix keeps them clear of the placeholders a condition brings with it.
+	const names = {};
+	const placeholders = {};
+
+	const assignments = Object.keys(marshalled).map((field, i) => {
+		names[`#set${i}`] = field;
+		placeholders[`:set${i}`] = marshalled[field];
+
+		return `#set${i} = :set${i}`;
+	});
 
 	return ddb.updateItem({
 		Key: {
@@ -1048,16 +1143,10 @@ function markCampaign(entity, campaignId, values, condition) {
 			keyid: {S: `campaigns:${campaignId}`}
 		},
 		TableName: "Campaigns",
-		AttributeUpdates: Object.keys(marshalled).reduce((attrs, entry) => {
-			attrs[entry] = {
-				Action: "PUT",
-				Value: marshalled[entry]
-			};
-
-			return attrs;
-		}, {}),
-
-		...(condition ?? {})
+		UpdateExpression: `SET ${assignments.join(", ")}`,
+		...(condition?.ConditionExpression ? { ConditionExpression: condition.ConditionExpression } : {}),
+		ExpressionAttributeNames: { ...names, ...(condition?.ExpressionAttributeNames ?? {}) },
+		ExpressionAttributeValues: { ...placeholders, ...(condition?.ExpressionAttributeValues ?? {}) }
 	}).promise();
 }
 
@@ -1113,6 +1202,15 @@ async function getOnDemandPrice(instanceType, region) {
 }
 
 function respond(statusCode, headers, body, success) {
+
+	// Only the first response reaches the caller. A second can come from the catch-all in
+	// exports.main after a path that already answered, and is dropped rather than sent twice.
+	if (responded) {
+		console.log(`[-] Already responded; dropping a later ${statusCode} response.`, JSON.stringify(body));
+		return Promise.resolve((typeof body == "string") ? body : body?.msg);
+	}
+
+	responded = true;
 
 	// Include terraform dns names as allowed origins, as well as localhost.
 	const allowed_origins = [variables.www_dns_names, "https://localhost"];
