@@ -662,7 +662,11 @@ local regionKeys = std.objectFields(settings.regions);
 				// fleet fills completely and at once instead of trickling in.
 				"ec2:CreateCapacityReservation",
 				"ec2:CancelCapacityReservation",
-				"ec2:DescribeCapacityReservations"
+				"ec2:DescribeCapacityReservations",
+
+				// A reservation is per-AZ, and NPK has subnets in zones that don't carry
+				// every GPU type, so the zones are narrowed to those that offer it first.
+				"ec2:DescribeInstanceTypeOfferings"
 			],
 			resources: ["*"]
 		},{

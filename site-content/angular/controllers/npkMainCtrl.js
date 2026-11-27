@@ -645,14 +645,19 @@ angular
           try {
             data = JSON.parse(data);
           } catch (e) {
-            data = {msg: "Error parsing response JSON.", success: false};
+            // An empty body almost always means API Gateway answered in place of the Lambda (a
+            // crash or a timeout) without CORS headers, so the browser withholds the response.
+            // Say that, rather than blaming the JSON.
+            data = {
+              msg: (xhr.status > 0) ?
+                "The API returned HTTP " + xhr.status + " with a response that could not be read." :
+                "No readable response from the API. The request may have failed or timed out before NPK could answer; check the execute_campaign logs in CloudWatch.",
+              success: false
+            };
           }
 
-          if (data.success == false) {
-            $scope.modalMessages.error = [data.msg];
-          } else {
-            $scope.modalMessages.success = [data.msg];
-          }
+          // Every non-2xx answer is a failure. API Gateway's own errors carry 'message', not 'msg'.
+          $scope.modalMessages.error = [data.msg ?? data.message ?? ("Request failed with HTTP " + xhr.status + ".")];
 
           $scope.$digest();
 
@@ -1128,6 +1133,9 @@ angular
       $('#use_manual').prop('checked', !$('#use_manual').prop('checked'));
       $scope.use_manual = $('#use_manual').prop('checked');
 
+      // Optimized kernels are the default either way; only the manual section can turn them off.
+      $scope.optimized_kernels = true;
+
       if ($scope.use_manual) {
         $scope.manual_arguments = "";
         $('manual_arguments').prop('disabled', false);
@@ -1176,6 +1184,15 @@ angular
       $scope.compileManualCommands();
     });
 
+    // Optimized kernels (-O). On by default: the speed estimates were benchmarked with them, and
+    // for fast hash types pure kernels run at a fraction of the rate. Must match what
+    // hashcat_wrapper.js on the nodes actually passes.
+    $scope.optimized_kernels = true;
+
+    $scope.$watch('optimized_kernels', function() {
+      $scope.compileManualCommands();
+    });
+
 
     $scope.manual_command = "";
     $scope.keyspace_command = "";
@@ -1195,7 +1212,6 @@ angular
       var args = [
         "./hashcat/hashcat.bin",
         "--quiet",
-        "-O",
         "-w",
         "4",
         "-m",
@@ -1203,6 +1219,12 @@ angular
         "-a",
         $scope.attackType,
       ];
+
+      // The nodes add -O themselves unless it's switched off or already in the raw arguments.
+      var manualTokens = ($scope.manual_arguments || "").split(" ");
+      if ($scope.optimized_kernels && manualTokens.indexOf("-O") < 0 && manualTokens.indexOf("--optimized-kernel-enable") < 0) {
+        args.push("-O");
+      }
 
       if ($scope.attackType == 0) {
         $scope.selectedRules.forEach(function(e) {
@@ -1543,7 +1565,8 @@ angular
         hashType: $scope.hashType,
         instanceCount: $scope.instanceCount,
         instanceDuration: $scope.instanceDuration,
-        priceTarget: $scope.totalPrice
+        priceTarget: $scope.totalPrice,
+        optimizedKernels: ($scope.optimized_kernels !== false)
       }
 
       if ($scope.use_mask) {

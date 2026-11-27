@@ -250,6 +250,14 @@ exports.main = async function(event, context, callback) {
 		verifiedManifest.manualArguments = campaign.manualArguments;
 	}
 
+	// Optimized kernels (-O) are the default, and are what the price estimates assume. Turning
+	// them off trades speed for unlimited candidate length, so it has to be explicit.
+	if (typeof campaign.optimizedKernels != "undefined" && typeof campaign.optimizedKernels != "boolean") {
+		return respond(400, {}, "optimizedKernels must be true or false.", false);
+	}
+
+	verifiedManifest.optimizedKernels = campaign.optimizedKernels ?? true;
+
 	if (campaign.manualMask) {
 		if (campaign.mask || campaign.rulesFiles || campaign.dictionaryFile) {
 			return respond(400, {}, "Manual masks cannot be combined with any other attack type.", false);

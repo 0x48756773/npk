@@ -216,13 +216,16 @@ exports.main = async function(event, context, callback) {
 				// it bills at the full On-Demand rate until cancelled, however empty it is.
 				// The monitor sweeps for this too, but a user who cancels a campaign should
 				// not have to wait a minute for the charges to stop.
+				//
+				// For a campaign that got as far as running, the monitor will usually have
+				// released it already, once the fleet filled. A failure here is then expected.
 				if (!!campaign.capacityReservationId && campaign.capacityReservationId != "<none>") {
 					await ec2.cancelCapacityReservation({
 						CapacityReservationId: campaign.capacityReservationId
 					}).promise().then(() => {
 						console.log(`[+] Released capacity reservation ${campaign.capacityReservationId}.`);
 					}, (e) => {
-						console.log(`[-] Unable to release capacity reservation ${campaign.capacityReservationId}.`, e);
+						console.log(`[-] Unable to release capacity reservation ${campaign.capacityReservationId}; the monitor may already have released it once the fleet filled.`, e);
 					});
 				}
 

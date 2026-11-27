@@ -704,6 +704,32 @@ async function processOnDemandFleets() {
 				continue;
 			}
 
+			// The reservation's only job is to make the fleet fill completely and at once. Once
+			// every node the campaign was sized for is running, that job is done, so it is
+			// released now rather than when the campaign ends. Instances already in a cancelled
+			// reservation keep running at the same On-Demand rate; nothing about the campaign
+			// changes.
+			//
+			// This also caps the one outcome nothing else would report. AWS documents Capacity
+			// Reservations with EC2 Fleet only for 'instant' fleets, and NPK uses 'request'
+			// fleets for ValidUntil. If a 'request' fleet launches its instances alongside the
+			// reservation instead of into it, both bill at the full rate for as long as the
+			// reservation is held. Releasing it here limits that to the time the fleet takes to
+			// fill, and the release logs which of the two happened.
+			//
+			// Only an explicit target counts, and only instances that are actually running.
+			// Releasing while the fleet is still filling would aim its remaining launches at a
+			// cancelled reservation, which could turn a launch that was about to succeed into
+			// an under-capacity reap.
+			const reservedFor = fleet.TargetCapacitySpecification?.TotalTargetCapacity;
+			const runningCount = Object.keys(fleet.instances).filter((instanceId) => {
+				return fleet.instances[instanceId].State == "running";
+			}).length;
+
+			if (reservedFor > 0 && runningCount >= reservedFor) {
+				promises.push(cancelCapacityReservation(ec2, fleet.tags.CampaignId, runningCount));
+			}
+
 			// Nodes power themselves off when they finish; reap the fleet once they've all gone.
 			if (!!instanceCount && !hasLiveInstances && !isDeleted) {
 				promises.push(deleteFleet(ec2, fleetId).then(() => {
@@ -904,7 +930,12 @@ function deleteLaunchTemplate(ec2, campaignId) {
 // running inside it, so a reservation left behind by a finished campaign is an open-ended
 // charge for nothing. It's found by tag rather than by stored ID so that a campaign whose
 // database write failed still gets cleaned up.
-async function cancelCapacityReservation(ec2, campaignId) {
+//
+// It is also released as soon as the fleet is full. That caller passes the number of running
+// instances, and each reservation's occupancy is checked against it first. This is how a
+// 'request' fleet launching outside its reservation, and so billing twice, shows up in the
+// logs. Once cancelled, a reservation is no longer 'active', so later passes find nothing.
+async function cancelCapacityReservation(ec2, campaignId, runningInstances = 0) {
 	if (!campaignId) {
 		return;
 	}
@@ -922,6 +953,16 @@ async function cancelCapacityReservation(ec2, campaignId) {
 		}).promise();
 
 		for (const reservation of reservations.CapacityReservations ?? []) {
+			if (runningInstances > 0) {
+				const inUse = (reservation.TotalInstanceCount ?? 0) - (reservation.AvailableInstanceCount ?? 0);
+
+				if (inUse < runningInstances) {
+					console.log(`[!] Campaign ${campaignId} has ${runningInstances} running instance(s), but only ${inUse} are in capacity reservation ${reservation.CapacityReservationId}. The rest launched alongside it, and have been billed in addition to it since launch.`);
+				} else {
+					console.log(`[+] All ${runningInstances} running instance(s) of campaign ${campaignId} are in capacity reservation ${reservation.CapacityReservationId}; releasing it now that the fleet is full.`);
+				}
+			}
+
 			await ec2.cancelCapacityReservation({
 				CapacityReservationId: reservation.CapacityReservationId
 			}).promise().then(() => {

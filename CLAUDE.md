@@ -251,6 +251,16 @@ Two alternatives were considered and rejected:
 Because `Type: "request"` is retained, `ValidUntil` + `TerminateInstancesWithExpiration` still
 bound the fleet exactly as before.
 
+**The zone walk only tries zones that offer the instance type.** `vpc.libsonnet` builds a
+subnet in every AZ of a region, and GPU types are rarely offered in all of them. A reservation
+requested in a zone that doesn't carry the type is refused with code `Unsupported` ("The
+requested configuration is currently not supported"), which says nothing about capacity. This
+was originally rethrown, so a campaign failed outright whenever the walk happened to reach such
+a zone first. `acquireCapacityReservation()` now narrows the zones with
+`DescribeInstanceTypeOfferings`, and treats a per-zone `Unsupported` as a skip. Only if
+*every* zone refuses as `Unsupported` and none is merely full is it raised. That outcome won't
+change with time, so parking would just wait out the deadline in silence.
+
 **The cost caveat is the main risk in this design.** A reservation bills at the full On-Demand
 rate from creation, occupied or not. Release is wired into every terminal path — monitor reap,
 monitor under-capacity, `delete_campaign`, and all four abort paths in `execute_campaign` — and
@@ -258,6 +268,16 @@ is found by `CampaignId` **tag** rather than stored ID, so a campaign whose DB w
 still swept. Every reservation also carries `EndDateType: "limited"` as a last backstop, so a
 fully orphaned one self-terminates instead of billing indefinitely. **Any new exit path from
 the On-Demand launch flow must release the reservation.**
+
+**For a launch that succeeds, the reservation does not last the campaign.** `spot_monitor`
+releases it as soon as every instance the fleet was sized for is `running`. Its only job is to
+make the fleet fill completely and at once. Instances already in a cancelled reservation keep
+running at the same On-Demand rate, so after the fill it is only a liability. Releasing it early
+also limits the cost of the instant-only risk described under future work to the fill time. The
+release requires an explicit `TotalTargetCapacity`, and counts only `running` instances, never
+`pending` ones. Releasing it while the fleet is still filling would point the remaining launches
+at a cancelled reservation. The terminal-path releases stay as they are: they cover every
+campaign that never fills.
 
 ### Design decision: the queue lives in `execute_campaign`, not the monitor
 
@@ -328,7 +348,7 @@ estimate cannot cause an overrun; it can only make the estimate slightly wrong.
 |---|---|
 | `create_campaign` | validates `provisioningModel`; selects the quota code per model; persists the model |
 | `execute_campaign` | branches to launch template + `createFleet`; resolves the On-Demand rate from the Pricing API; bounds fleet life by cost *and* duration; rejects budgets too small to buy a minute. Then: capacity reservation + queue, internal `capacity-retry` invocation path, claim lease, manifest URL re-signing, budget/subnet checks moved ahead of resource creation |
-| `spot_monitor` | split into independent `processSpotFleets()` / `processOnDemandFleets()` passes joined by `Promise.allSettled`; On-Demand costing is rate × uptime. Then: third `processPendingCampaigns()` pass, under-capacity reaping, reservation release, monotonic cost clamping |
+| `spot_monitor` | split into independent `processSpotFleets()` / `processOnDemandFleets()` passes joined by `Promise.allSettled`; On-Demand costing is rate × uptime. Then: third `processPendingCampaigns()` pass, under-capacity reaping, reservation release (on terminal paths, and as soon as the fleet is full), monotonic cost clamping |
 | `delete_campaign` | branches to `deleteFleets`; deletes the launch template; "mark cancelled" extracted to one helper used on every exit path. Then: handles the two capacity states, releases the reservation |
 
 **Front end**
@@ -415,6 +435,37 @@ separately.
 - **Nodes wait for the full fleet.** See the keyspace splitting section above.
 - **Capacity is reserved up front**, which removes the root cause rather than detecting it.
 
+### Fixes from the first reservation-path runs (2026-11)
+
+- **Parking a campaign always crashed, and the dashboard reported "Error parsing response
+  JSON."** `markCampaign()` combined the legacy `AttributeUpdates` parameter with
+  `ConditionExpression`. DynamoDB rejects any mix of legacy and expression parameters with a
+  `ValidationException`, not a conditional failure, so the park write threw out of the handler.
+  API Gateway answered with a bare 502 and no CORS headers, which the browser withholds. The
+  helper now always builds an `UpdateExpression`. Every other write in the repo uses either
+  `AttributeUpdates` alone or expressions alone. Keep it that way.
+- **Nothing escapes `execute_campaign` as a Lambda error any more.** A catch-all in
+  `exports.main` answers through `respond()`, which is now idempotent, and `origin` is read
+  before anything can fail, so every error response is readable in the browser. Beyond that, the
+  remaining unreadable case is API Gateway's 29s integration timeout. The Lambda runs for up to
+  60s, so a launch can still succeed after the browser has given up on it. The dashboard now says
+  so instead of blaming the JSON.
+- **`Unsupported` zones no longer abort the reservation walk.** See the capacity design
+  decision above.
+- **Nodes pass `-O` again.** Upstream `c15e924` removed it from `hashcat_wrapper.js`, but the
+  campaign builder kept showing it in the command it calls "the literal command that will be
+  executed on each node". The speed and price estimates are also benchmarked with it (see the
+  commented benchmark commands in `userdata.tpl`). Fast hash types therefore ran far below the
+  quoted rate unless `-O` was typed into Raw Arguments. It is now a per-campaign
+  `optimizedKernels` manifest field, on by default and switchable off in the manual section
+  (pure kernels accept longer candidates). **Absent means on**, because that is what the builder
+  always showed. The wrapper puts it in the base parameters so the `--keyspace` pass and the run
+  use the same kernel, and skips it when the raw arguments already contain it.
+- **The reservation is released as soon as the fleet is full**, rather than when the campaign
+  ends. This caps the possible double billing from the instant-only restriction, and logs
+  whether it happened (see future work). `delete_campaign` still cancels the stored reservation
+  ID, so for a campaign that ran it now usually logs a harmless failure. Its log message says so.
+
 Also fixed while in the area: the `Edit` tooling silently rewrote several files to CRLF.
 `.gitattributes` pins `*.sh` and `*.tpl` to `eol=lf` precisely because a CRLF in userdata fails
 on the nodes with a bare `$'\r': command not found`. **Check line endings after editing**
@@ -451,7 +502,23 @@ Three API behaviours the design rests on and that are still assumed, not observe
 - **The minimum `EndDate`** (assumed ≥1 hour; `acquireCapacityReservation()` clamps to it).
 - **A launch template's `CapacityReservationTarget` actually routes EC2 Fleet instances into
   the reservation** rather than launching alongside it. Confirm on the first run that you are
-  billed **once**, not twice.
+  billed **once**, not twice. **This one is now actively suspect.** The EC2 Fleet user guide
+  says *"On-Demand Capacity Reservations are available only for EC2 Fleet with the request type
+  set to `instant`"*. It documents targeting only through a resource group
+  (`CapacityReservationResourceGroupArn`), never a bare `CapacityReservationId`. It does not say
+  what a `request` fleet does with such a template: reject it, ignore the target, or launch
+  outside the reservation. The last of those bills twice. **That case is now capped and
+  reported.** The monitor releases the reservation once the fleet is full, so double billing can
+  last only as long as the fill. Before releasing, it compares the reservation's occupancy
+  (`TotalInstanceCount - AvailableInstanceCount`) against the running instance count and logs
+  the result. On the first run, look in the `spot_monitor` logs for either
+  `[+] All N running instance(s) of campaign … are in capacity reservation …` (targeting works)
+  or `[!] Campaign … has N running instance(s), but only M are in capacity reservation …`
+  (instances launched outside it, and the design needs revisiting). The remaining possibility
+  is the fleet rejecting the template outright. That surfaces either as `createFleet` failing in
+  `execute_campaign`, an abort path that releases the reservation, or as a fleet that launches
+  nothing and is reaped as under-capacity. Either way the campaign fails visibly rather than
+  billing twice.
 
 Suggested first run, in a test account:
 
@@ -467,7 +534,10 @@ Suggested first run, in a test account:
 5. Let one campaign hit its cost ceiling and confirm the monitor deletes the fleet.
 6. Cancel another mid-run from the UI and confirm the fleet, the launch template **and the
    capacity reservation** are all gone. Check the reservation explicitly — it is the only one
-   of the three that costs money while orphaned.
+   of the three that costs money while orphaned. For a campaign whose fleet filled, the
+   reservation should already be `cancelled` within a minute or two of the nodes reaching
+   `running`, before you cancel anything. Check the `spot_monitor` log line described above
+   while you're there.
 7. Confirm a **spot** campaign still works end to end — the monitor was restructured twice.
 8. Cancel a campaign from the UI and watch the *next* monitor pass. It must stay `CANCELLED` /
    inactive — the race the `active: !isDeleted` fix addresses, visible only in the window
@@ -552,6 +622,9 @@ campaign first and extrapolate from the reported `%` rate before committing to a
 ## Conventions worth preserving
 
 - Absent `provisioningModel` means spot, everywhere. Keep new read sites consistent.
+- Absent `optimizedKernels` means `-O` is on. The builder's command preview
+  (`compileManualCommands()`) and `hashcat_wrapper.js` must agree on what a node runs. They
+  drifted once, and the cost was silent.
 - The **three** monitor passes are deliberately independent, joined by `Promise.allSettled`.
   A failure in one must never prevent another from enforcing its cost ceiling — do not merge
   them or chain them.
